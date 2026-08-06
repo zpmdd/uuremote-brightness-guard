@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.zpmdd.uuremote-brightness-guard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__RUNTIME_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>UURBG_HELPER_PATH</key>
+        <string>__HELPER_PATH__</string>
+        <key>UURBG_STATE_DIR</key>
+        <string>__STATE_DIR__</string>
+        <key>UURBG_FALLBACK</key>
+        <string>0.85</string>
+        <key>UURBG_DDC_FALLBACK</key>
+        <string>0.70</string>
+        <key>UURBG_MONITOR_STARTUP_ACTION</key>
+        <string>1</string>
+        <key>UURBG_DIM_FACTOR</key>
+        <string>0.0</string>
+        <key>UURBG_DISCONNECT_GRACE</key>
+        <string>2.0</string>
+        <key>UURBG_POLL_INTERVAL</key>
+        <string>0.25</string>
+        <key>UURBG_SLEEP_AFTER_DISCONNECT</key>
+        <string>true</string>
+        <key>UURBG_DISPLAY_SLEEP_DELAY</key>
+        <string>1.0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>StandardOutPath</key>
+    <string>__STDOUT_PATH__</string>
+    <key>StandardErrorPath</key>
+    <string>__STDERR_PATH__</string>
+</dict>
+</plist>

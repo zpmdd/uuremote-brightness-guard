@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.build/
+bin/DisplayBrightnessTool
+*.log
+guard-state.json
+brightness-snapshot.json
+.idea/
+.vscode/

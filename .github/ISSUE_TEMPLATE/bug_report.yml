@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a brightness, session-detection, recovery, or installation problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep physical access to the Mac while testing. Remove account, device, IP, and serial-number information from logs.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "26.5.2"
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac and display topology
+      placeholder: "M-series Mac, built-in display, two external displays through USB-C"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: UU Remote and MonitorControl versions
+      placeholder: "UU Remote 4.34.0; MonitorControl 4.3.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: ddc
+    attributes:
+      label: If external displays are used, can MonitorControl change each one through DDC/CI?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+        - "Built-in display only"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include connect/disconnect, restart, cable, dock, or topology changes.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Sanitized status and recent events
+      description: Paste output from Status.command. Remove private information first.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I kept another way to access the Mac while reproducing the issue.
+          required: true
+        - label: I removed account, remote-device, IP, and serial-number information.
+          required: true
