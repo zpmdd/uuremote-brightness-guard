@@ -1,55 +1,55 @@
-# UU Remote Brightness Guard
+# UU 远程亮度守护
 
-[简体中文](README.zh-CN.md)
+[English](README.en.md)
 
-[![Test](https://github.com/zpmdd/uuremote-brightness-guard/actions/workflows/test.yml/badge.svg)](https://github.com/zpmdd/uuremote-brightness-guard/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![macOS: Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black.svg)](#requirements)
+[![测试](https://github.com/zpmdd/uuremote-brightness-guard/actions/workflows/test.yml/badge.svg)](https://github.com/zpmdd/uuremote-brightness-guard/actions/workflows/test.yml)
+[![许可证：MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![macOS：Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black.svg)](#运行要求)
 
-A small macOS LaunchAgent that automatically dims every display when this Mac becomes the controlled side of a UU Remote session. After the last session disconnects, it restores each display's previous brightness and then sleeps the displays without sleeping the Mac.
+一个小型 macOS LaunchAgent：当本机成为 UU 远程被控端时，自动保存每块显示器的亮度并降到最低；最后一个远程会话断开后，逐屏恢复原亮度，再只让显示器息屏，Mac 本身继续运行。
 
-> This project directly controls display brightness and gamma. Read [Safety and recovery](#safety-and-recovery) before enabling it, especially if you use external DDC/CI monitors.
+> 本项目会直接控制显示器硬件亮度和 gamma。启用前请先阅读[安全与恢复](#安全与恢复)，使用 DDC/CI 外接屏时尤其重要。
 
-## Features
+## 功能
 
-- Detects real UU Remote connect/disconnect events from the local server log.
-- Saves brightness separately for the built-in display and every external display.
-- Dims external monitors to hardware 0% through DDC/CI, then holds their gamma at 0 for a near-black physical output.
-- Restores the captured values after the final session disconnects, with a two-second debounce for connection glitches.
-- Uses a safe fallback when a display's original value cannot be read: MonitorControl-style 85%, mapped to 70% raw DDC for external displays.
-- When MonitorControl is installed and running, pauses it only while brightness is being changed, preventing its synchronization loop from overwriting per-display values.
-- Handles stale state after a Mac or monitor restart and retries a failed restore.
-- Sleeps only the displays one second after a successful disconnect restore. Keyboard or mouse input wakes them at the restored brightness.
-- Runs locally, without `sudo`, accounts, cloud services, or network requests.
+- 从本机 UU 服务日志识别真实的远程连接和断开事件。
+- 分别保存内置屏幕及每块外接屏的亮度。
+- 外接屏先通过 DDC/CI 降到硬件 0%，再持续把 gamma 保持为 0，得到接近全黑的物理输出。
+- 最后一个会话断开 2 秒后恢复各屏原值，避免短暂网络抖动造成反复闪屏。
+- 某块屏幕读不到原值时，采用 MonitorControl 页面意义上的 85% 兜底；在已验证配置中，外接屏对应原始 DDC 70%。
+- 如果已安装且正在运行 MonitorControl，调整期间会暂时挂起它，避免其同步线程覆盖逐屏值。
+- 能识别 Mac 或显示器重启后的旧状态，并持续重试未成功的恢复。
+- 恢复成功 1 秒后仅调用显示器休眠；键盘或鼠标唤醒后仍是恢复后的亮度。
+- 完全本地运行，不需要 `sudo`、账号、云服务或网络请求。
 
 ```mermaid
 flowchart LR
-    A[UU session connects] --> B[Save each display]
-    B --> C[Dim hardware and gamma]
-    C --> D[Last session disconnects]
-    D --> E[Restore saved values]
-    E --> F[Sleep displays only]
+    A[UU 远程连接] --> B[逐屏保存原值]
+    B --> C[硬件亮度与 gamma 降到最低]
+    C --> D[最后一个会话断开]
+    D --> E[逐屏恢复]
+    E --> F[仅显示器息屏]
 ```
 
-## Requirements
+## 运行要求
 
-- An Apple Silicon Mac. Intel Macs are not supported by the current DDC service discovery code.
-- [UU Remote](https://uuyc.163.com/) installed as `/Applications/UURemote.app`.
-- [MonitorControl](https://github.com/MonitorControl/MonitorControl) is optional for a built-in-display-only Mac. It is strongly recommended with external displays so you can verify DDC/CI support and recover brightness manually if needed.
-- External monitors with DDC/CI enabled. Some docks, adapters, or monitor inputs may block DDC/CI.
-- Xcode Command Line Tools, used once to compile the local Swift helper. Install them with `xcode-select --install`.
+- Apple Silicon Mac。当前 DDC 服务发现方式暂不支持 Intel Mac。
+- [UU 远程](https://uuyc.163.com/) 位于 `/Applications/UURemote.app`。
+- 只有内置屏的 Mac 不需要安装 [MonitorControl](https://github.com/MonitorControl/MonitorControl)。使用外接屏时强烈建议安装，以便验证 DDC/CI 兼容性，并在必要时手动恢复亮度。
+- 外接显示器已启用 DDC/CI；部分扩展坞、转接器或显示器输入口可能不透传 DDC/CI。
+- Xcode Command Line Tools，仅在安装时用于本机编译 Swift 辅助工具；可运行 `xcode-select --install` 安装。
 
-The initial release was validated on Apple Silicon with macOS 26.5.2, UU Remote 4.34.0, MonitorControl 4.3.3, one built-in display, and two Dell U2720QM displays. Other versions and display topologies are currently unverified.
+首个版本已在 Apple Silicon、macOS 26.5.2、UU 远程 4.34.0、MonitorControl 4.3.3、一块内置屏和两块 Dell U2720QM 上验证。其他系统版本和显示器组合目前未验证。
 
-## Quick start
+## 快速安装
 
-### Download and double-click
+### 下载后双击
 
-1. Download [UURemoteBrightnessGuard.zip](https://github.com/zpmdd/uuremote-brightness-guard/releases/latest/download/UURemoteBrightnessGuard.zip) from the latest release and extract it.
-2. Make sure UU Remote is in `/Applications`. If you use external displays, installing MonitorControl is strongly recommended.
-3. Double-click `Install.command`. If macOS blocks it, right-click the file and choose **Open**, or use the Terminal method below.
+1. 从最新版本下载并解压 [UURemoteBrightnessGuard.zip](https://github.com/zpmdd/uuremote-brightness-guard/releases/latest/download/UURemoteBrightnessGuard.zip)。
+2. 确认 UU 远程位于 `/Applications`；如使用外接屏，强烈建议同时安装 MonitorControl。
+3. 双击 `Install.command`。如果 macOS 阻止运行，请右键文件选择“打开”，或改用下面的终端方式。
 
-### Terminal
+### 终端安装
 
 ```bash
 git clone https://github.com/zpmdd/uuremote-brightness-guard.git
@@ -57,70 +57,70 @@ cd uuremote-brightness-guard
 ./install.sh
 ```
 
-Installation is per-user and does not require administrator access. The runtime is copied to:
+安装仅针对当前用户，不需要管理员权限。运行文件会被复制到：
 
 ```text
 ~/Library/Application Support/UURemoteBrightnessGuard
 ```
 
-The downloaded source folder can be moved or deleted after installation. Open the installed folder in Finder to use `Status.command`, `Restore.command`, or `Uninstall.command`.
+安装完成后，下载的源码目录可以移动或删除。使用 Finder 打开上述安装目录，即可运行 `Status.command`、`Restore.command` 或 `Uninstall.command`。
 
-## Installed controls
+## 已安装的控制入口
 
-| Control | Purpose |
+| 入口 | 用途 |
 | --- | --- |
-| `Status.command` | Show active UU sessions, brightness state, LaunchAgent state, and the latest local events. |
-| `Restore.command` | Stop the guard briefly, restore the saved values or the 85%/70% fallback, then re-enable it. |
-| `Uninstall.command` | Restore first when necessary, unload the agent, and remove the installed runtime. |
+| `Status.command` | 查看 UU 活跃会话、亮度状态、LaunchAgent 状态及最近事件。 |
+| `Restore.command` | 暂停守护，恢复已保存的原值；没有快照时采用内屏 85% / 外屏原始 DDC 70% 兜底，随后重新启用守护。 |
+| `Uninstall.command` | 必要时先恢复亮度，再卸载服务并删除运行文件。 |
 
-The LaunchAgent label is `io.github.zpmdd.uuremote-brightness-guard`. Logs are stored in `~/Library/Logs/UURemoteBrightnessGuard`. Uninstall keeps logs by default; `./uninstall.sh --purge` removes them too.
+LaunchAgent 名称为 `io.github.zpmdd.uuremote-brightness-guard`。日志位于 `~/Library/Logs/UURemoteBrightnessGuard`。普通卸载会保留日志；运行 `./uninstall.sh --purge` 可一并删除。
 
-## Safety and recovery
+## 安全与恢复
 
-Before relying on the guard, confirm that MonitorControl can change every external monitor through DDC/CI. Test one connect/disconnect cycle while you can still access the Mac locally.
+正式使用前，请先确认 MonitorControl 能通过 DDC/CI 调整所有外接屏，并在能够本地操作 Mac 的情况下完成一次连接、断开测试。
 
-If a monitor stays dark after a crash, restart, or topology change:
+如果崩溃、重启或显示器拓扑变化后仍有屏幕保持黑暗：
 
-1. Wake the displays with a key or mouse movement.
-2. Open `~/Library/Application Support/UURemoteBrightnessGuard` in Finder.
-3. Run `Restore.command`. It restores the saved snapshot when available; otherwise it applies the 85% built-in / 70% raw-DDC fallback.
+1. 用键盘或鼠标唤醒显示器。
+2. 在 Finder 中打开 `~/Library/Application Support/UURemoteBrightnessGuard`。
+3. 运行 `Restore.command`。存在快照时恢复原值；没有快照时使用内屏 85% / 外屏原始 DDC 70% 兜底。
 
-You can also run:
+也可在终端运行：
 
 ```bash
 "$HOME/Library/Application Support/UURemoteBrightnessGuard/restore.sh"
 ```
 
-Do not disconnect, power-cycle, or rearrange monitors while testing an active dimmed session unless you have another way to reach the Mac. The project uses private macOS display APIs, so a future macOS update may require changes.
+首次测试远程变暗期间，不要随意断开、重启或重新排列显示器，除非你还有其他方式进入 Mac。本项目使用 macOS 私有显示接口，未来系统升级可能需要适配。
 
-## How it works
+## 工作原理
 
-The Python guard follows UU Remote's local `UURemoteServer.log` and tracks `peerConnected` / `disconnected` transitions by session handle. It ignores events from a previous boot or server process. MonitorControl is not called to change brightness; when present, its process is paused briefly only to avoid conflicting writes.
+Python 守护程序持续读取本机 `UURemoteServer.log`，按会话句柄跟踪 `peerConnected` / `disconnected` 状态，并忽略上次开机或上一个 UU 服务进程留下的旧事件。亮度调整并不调用 MonitorControl；它存在时只会被短暂挂起，以避免同时写入产生冲突。
 
-The Swift helper uses:
+Swift 辅助工具使用：
 
-- `DisplayServices` for built-in display brightness;
-- DDC/CI VCP code `0x10` for external hardware brightness;
-- CoreGraphics gamma tables for the final near-black output and exact gamma restoration.
+- `DisplayServices` 控制内置屏幕亮度；
+- DDC/CI VCP `0x10` 控制外接屏硬件亮度；
+- CoreGraphics gamma 表实现最后一级近乎全黑的输出，并在断开后精确恢复 gamma。
 
-The snapshot and state files use mode `0600` and contain brightness values and transient display identifiers only. They do not store display names, serial numbers, UU accounts, remote device IDs, or network addresses. Successful restoration deletes the snapshot.
+快照和状态文件权限为 `0600`，只保存亮度值和临时显示器标识，不保存显示器名称、序列号、UU 账号、远端设备 ID 或网络地址。恢复成功后会自动删除亮度快照。
 
-## Configuration
+## 配置
 
-Defaults live in `launchd/io.github.zpmdd.uuremote-brightness-guard.plist`:
+默认值位于 `launchd/io.github.zpmdd.uuremote-brightness-guard.plist`：
 
-| Variable | Default | Meaning |
+| 变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `UURBG_DIM_FACTOR` | `0.0` | Gamma factor during a remote session. |
-| `UURBG_DISCONNECT_GRACE` | `2.0` | Seconds to wait before restore after the last disconnect. |
-| `UURBG_FALLBACK` | `0.85` | Built-in/combined fallback when the original value is unavailable. |
-| `UURBG_DDC_FALLBACK` | `0.70` | Raw external DDC fallback corresponding to combined 85% in the tested MonitorControl setup. |
-| `UURBG_SLEEP_AFTER_DISCONNECT` | `true` | Sleep displays after a successful disconnect restore. |
-| `UURBG_DISPLAY_SLEEP_DELAY` | `1.0` | Delay before `pmset displaysleepnow`. |
+| `UURBG_DIM_FACTOR` | `0.0` | 远控期间的 gamma 系数。 |
+| `UURBG_DISCONNECT_GRACE` | `2.0` | 最后断开后等待恢复的秒数。 |
+| `UURBG_FALLBACK` | `0.85` | 无法读取原值时的内屏/组合亮度兜底。 |
+| `UURBG_DDC_FALLBACK` | `0.70` | 已验证 MonitorControl 配置中，对应组合亮度 85% 的外接屏原始 DDC 值。 |
+| `UURBG_SLEEP_AFTER_DISCONNECT` | `true` | 恢复成功后是否让显示器息屏。 |
+| `UURBG_DISPLAY_SLEEP_DELAY` | `1.0` | 调用 `pmset displaysleepnow` 前的延时。 |
 
-Advanced users can edit these string values in the template and rerun `./install.sh`. Values are clamped by the guard where appropriate.
+高级用户可以修改模板中的字符串值，再运行 `./install.sh` 重新安装；守护程序会按范围校正数值。
 
-## Development
+## 开发与验证
 
 ```bash
 make lint
@@ -128,19 +128,19 @@ make test
 make build
 ```
 
-The display helper uses macOS private frameworks and is compiled locally rather than committed as an unsigned binary. Pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+显示器辅助工具依赖 macOS 私有框架，因此项目选择在用户本机编译，不提交未签名的二进制文件。欢迎提交改进，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## Limitations
+## 已知限制
 
-- Apple Silicon only in the current release.
-- UU Remote log formats are not a public API and may change.
-- DDC/CI behavior depends on the monitor, input, cable, dock, and macOS release.
-- External displays are matched by the runtime topology/slot order because the low-level service does not expose a stable public identifier.
-- MonitorControl is not required for a built-in-only setup. External-display use without it is possible but has less convenient compatibility testing and manual recovery.
-- This is an independent utility, not an official UU Remote or MonitorControl feature.
+- 当前版本仅支持 Apple Silicon。
+- UU 远程日志格式不是公开 API，后续版本可能变化。
+- DDC/CI 是否可用取决于显示器、输入口、线缆、扩展坞和 macOS 版本。
+- 底层服务没有稳定的公开显示器标识，因此外接屏按当前拓扑/槽位顺序匹配。
+- 只有内置屏时不需要 MonitorControl；有外接屏时也能独立运行，但兼容性验证和手动恢复会不够方便。
+- 本项目是独立工具，不是 UU 远程或 MonitorControl 官方功能。
 
-## License and acknowledgements
+## 许可与致谢
 
-This project is licensed under the [MIT License](LICENSE).
+本项目采用 [MIT License](LICENSE)。
 
-The DDC implementation follows ideas and patterns from the MIT-licensed [MonitorControl](https://github.com/MonitorControl/MonitorControl) project. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [LICENSE-MonitorControl.txt](LICENSE-MonitorControl.txt).
+DDC 实现参考了 MIT 许可的 [MonitorControl](https://github.com/MonitorControl/MonitorControl) 项目，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [LICENSE-MonitorControl.txt](LICENSE-MonitorControl.txt)。
