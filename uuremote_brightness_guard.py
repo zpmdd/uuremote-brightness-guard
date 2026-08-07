@@ -30,6 +30,11 @@ LOG_TIMESTAMP_RE = re.compile(
     r"^\[(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?\s"
 )
 BOOT_TIME_RE = re.compile(r"sec\s*=\s*(\d+)")
+POST_WAKE_PHASES = {
+    "awaiting-display-wake",
+    "post-wake-verification-pending",
+    "post-wake-repair-pending",
+}
 
 
 def utc_now() -> str:
@@ -210,14 +215,19 @@ class BrightnessGuard:
         self.poll_interval = env_float("UURBG_POLL_INTERVAL", 0.25, 0.1, 5.0)
         self.sleep_after_disconnect = env_bool("UURBG_SLEEP_AFTER_DISCONNECT", True)
         self.display_sleep_delay = env_float("UURBG_DISPLAY_SLEEP_DELAY", 1.0, 0.0, 10.0)
+        self.post_wake_delay = env_float("UURBG_POST_WAKE_DELAY", 4.0, 1.0, 30.0)
+        self.post_wake_retry = env_float("UURBG_POST_WAKE_RETRY", 3.0, 1.0, 60.0)
 
         self.tracker = SessionTracker()
         self.follower = LogFollower(self.current_log)
         self.restore_deadline: Optional[float] = None
+        self.post_wake_deadline: Optional[float] = None
         self.display_sleep_pending = False
         self.shutdown_requested = False
         self._lock_handle = None
         self.holder_process: Optional[subprocess.Popen] = None
+        self.event_monitor_process: Optional[subprocess.Popen] = None
+        self.last_event_monitor_attempt = 0.0
         self.boot_epoch = system_boot_epoch()
 
     def acquire_lock(self) -> None:
@@ -435,8 +445,137 @@ class BrightnessGuard:
         except (ProcessLookupError, PermissionError):
             return False
 
+    def event_monitor_is_alive(self) -> bool:
+        process = self.event_monitor_process
+        return process is not None and process.poll() is None
+
+    def event_monitor_detected(self) -> bool:
+        if self.event_monitor_is_alive():
+            return True
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-axo", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        prefix = f"{self.helper} events --parent-pid "
+        return any(line.strip().startswith(prefix) for line in result.stdout.splitlines())
+
+    def start_event_monitor(self) -> bool:
+        if self.event_monitor_is_alive():
+            return True
+        self.last_event_monitor_attempt = time.monotonic()
+        if not self.helper.is_file() or not os.access(self.helper, os.X_OK):
+            log_event("display_event_monitor_failed", reason="helper-missing")
+            return False
+        try:
+            process = subprocess.Popen(
+                [str(self.helper), "events", "--parent-pid", str(os.getpid())],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            log_event("display_event_monitor_failed", reason=type(exc).__name__)
+            return False
+
+        assert process.stdout is not None
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        if not ready:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            log_event("display_event_monitor_failed", reason="readiness-timeout")
+            return False
+        try:
+            payload = json.loads(process.stdout.readline())
+        except json.JSONDecodeError:
+            payload = {}
+        if (
+            process.poll() is not None
+            or not isinstance(payload, dict)
+            or payload.get("action") != "events"
+            or payload.get("event") != "ready"
+        ):
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            log_event("display_event_monitor_failed", reason="invalid-readiness")
+            return False
+        self.event_monitor_process = process
+        log_event("display_event_monitor_started")
+        return True
+
+    def stop_event_monitor(self) -> None:
+        process = self.event_monitor_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        self.event_monitor_process = None
+
+    def handle_display_event(self, event: str) -> None:
+        if event == "sleep":
+            log_event("display_sleep_detected")
+            return
+        if event != "wake":
+            return
+        log_event("display_wake_detected")
+        state = self.load_state()
+        if (
+            state is None
+            or state.get("phase") not in POST_WAKE_PHASES
+            or not self.snapshot_file.exists()
+            or self.tracker.active
+        ):
+            return
+        state["phase"] = "post-wake-verification-pending"
+        state["displayWokeAt"] = utc_now()
+        self.save_state(state)
+        self.post_wake_deadline = time.monotonic() + self.post_wake_delay
+        log_event("post_wake_verification_scheduled", delaySeconds=self.post_wake_delay)
+
+    def poll_display_events(self) -> None:
+        process = self.event_monitor_process
+        if process is None:
+            return
+        assert process.stdout is not None
+        while True:
+            ready, _, _ = select.select([process.stdout], [], [], 0)
+            if not ready:
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("action") == "events":
+                self.handle_display_event(str(payload.get("event", "")))
+        if process.poll() is not None:
+            log_event("display_event_monitor_stopped", exitCode=process.returncode)
+            self.event_monitor_process = None
+
     def request_display_sleep(self) -> bool:
         if not self.sleep_after_disconnect:
+            return False
+        if not self.start_event_monitor():
+            log_event("display_sleep_failed", reason="event-monitor-unavailable")
             return False
         if self.display_sleep_delay > 0:
             time.sleep(self.display_sleep_delay)
@@ -494,6 +633,74 @@ class BrightnessGuard:
             fallbacks=fallback_count,
         )
         return result.returncode == 0, payload if isinstance(payload, dict) else {}
+
+    def snapshot_helper_arguments(self, action: str) -> List[str]:
+        return [
+            action,
+            "--snapshot",
+            str(self.snapshot_file),
+            "--fallback",
+            str(self.fallback),
+            "--ddc-fallback",
+            str(self.ddc_fallback),
+        ]
+
+    @staticmethod
+    def helper_succeeded(ok: bool, payload: Dict[str, object]) -> bool:
+        return ok and payload.get("success") is True
+
+    def verify_post_wake_restore(self) -> bool:
+        state = self.load_state()
+        if (
+            state is None
+            or state.get("phase") not in POST_WAKE_PHASES
+            or not self.snapshot_file.exists()
+        ):
+            self.post_wake_deadline = None
+            return False
+        if self.tracker.active:
+            self.post_wake_deadline = None
+            log_event("post_wake_verification_deferred", reason="active-session")
+            return False
+
+        verify_arguments = self.snapshot_helper_arguments("verify")
+        verify_ok, verify_payload = self.helper_call(verify_arguments)
+        if self.helper_succeeded(verify_ok, verify_payload):
+            self.clear_state()
+            self.post_wake_deadline = None
+            log_event("post_wake_brightness_verified", repaired=False)
+            return True
+
+        restore_arguments = self.snapshot_helper_arguments("restore")
+        restore_ok, restore_payload = self.helper_call(restore_arguments)
+        time.sleep(0.4)
+        reverify_ok, reverify_payload = self.helper_call(verify_arguments)
+        if self.helper_succeeded(reverify_ok, reverify_payload):
+            self.clear_state()
+            self.post_wake_deadline = None
+            log_event(
+                "post_wake_brightness_verified",
+                repaired=True,
+                restoreSuccess=self.helper_succeeded(restore_ok, restore_payload),
+            )
+            return True
+
+        attempts = int(state.get("postWakeAttempts", 0)) + 1
+        state.update({
+            "phase": "post-wake-repair-pending",
+            "lastPostWakeAttemptAt": utc_now(),
+            "postWakeAttempts": attempts,
+            "pausedMonitorControlPids": [],
+            "sleepAfterRestore": False,
+        })
+        self.save_state(state)
+        self.post_wake_deadline = time.monotonic() + self.post_wake_retry
+        log_event(
+            "post_wake_brightness_pending",
+            attempts=attempts,
+            retryAfterSeconds=self.post_wake_retry,
+        )
+        return False
 
     def holder_is_alive(self, pid: object) -> bool:
         try:
@@ -662,15 +869,7 @@ class BrightnessGuard:
                 str(self.ddc_fallback),
             ]
         else:
-            helper_arguments = [
-                "restore",
-                "--snapshot",
-                str(self.snapshot_file),
-                "--fallback",
-                str(self.fallback),
-                "--ddc-fallback",
-                str(self.ddc_fallback),
-            ]
+            helper_arguments = self.snapshot_helper_arguments("restore")
         ok, payload = self.helper_call(helper_arguments)
 
         if restart_monitor_control and current_monitor_pids:
@@ -685,13 +884,26 @@ class BrightnessGuard:
                 self.resume_pids(current_monitor_pids)
         else:
             self.resume_pids(paused)
-        reported_success = payload.get("success") is not False if isinstance(payload, dict) else False
-        success = ok and reported_success
+        success = self.helper_succeeded(ok, payload)
         if success:
-            self.clear_state()
             log_event("brightness_restored", usedFallback=force_fallback)
             if sleep_after_success:
-                self.request_display_sleep()
+                state.update({
+                    "phase": "awaiting-display-wake",
+                    "restoredAt": utc_now(),
+                    "bootEpoch": self.boot_epoch,
+                    "pausedMonitorControlPids": [],
+                    "sleepAfterRestore": False,
+                    "postWakeAttempts": 0,
+                })
+                self.save_state(state)
+                if self.request_display_sleep():
+                    log_event("post_wake_verification_armed")
+                else:
+                    self.clear_state()
+                    log_event("post_wake_verification_skipped", reason="display-sleep-failed")
+            else:
+                self.clear_state()
         else:
             state.update({
                 "phase": "restore-pending",
@@ -745,6 +957,9 @@ class BrightnessGuard:
             "disconnectGraceSeconds": self.disconnect_grace,
             "sleepAfterDisconnect": self.sleep_after_disconnect,
             "displaySleepDelaySeconds": self.display_sleep_delay,
+            "postWakeDelaySeconds": self.post_wake_delay,
+            "postWakeRetrySeconds": self.post_wake_retry,
+            "eventMonitorRunning": self.event_monitor_detected(),
         }
 
     def request_shutdown(self, _signum: int, _frame: object) -> None:
@@ -756,6 +971,7 @@ class BrightnessGuard:
         signal.signal(signal.SIGINT, self.request_shutdown)
         signal.signal(signal.SIGHUP, self.request_shutdown)
 
+        event_monitor_started = self.start_event_monitor()
         self.reconstruct_sessions()
         log_event(
             "guard_started",
@@ -767,12 +983,25 @@ class BrightnessGuard:
         if self.tracker.active:
             self.engage()
         elif state is not None:
-            self.restore(restart_monitor_control=self.state_is_stale(state))
+            if (
+                state.get("phase") in POST_WAKE_PHASES
+                and self.snapshot_file.exists()
+                and not self.state_is_stale(state)
+                and event_monitor_started
+            ):
+                log_event("post_wake_state_recovered", phase=state.get("phase"))
+                if state.get("phase") != "awaiting-display-wake":
+                    self.post_wake_deadline = time.monotonic() + self.post_wake_retry
+            else:
+                self.restore(restart_monitor_control=self.state_is_stale(state))
 
         last_server_check = 0.0
         last_restore_retry = 0.0
         while not self.shutdown_requested:
             now = time.monotonic()
+            self.poll_display_events()
+            if not self.event_monitor_is_alive() and now - self.last_event_monitor_attempt >= 10:
+                self.start_event_monitor()
             for line in self.follower.poll():
                 transition = self.tracker.feed(line)
                 if not transition:
@@ -780,6 +1009,7 @@ class BrightnessGuard:
                 _, is_active = transition
                 if is_active:
                     self.restore_deadline = None
+                    self.post_wake_deadline = None
                     self.display_sleep_pending = False
                     log_event("session_connected", activeSessions=len(self.tracker.active_handles))
                     self.engage()
@@ -797,6 +1027,11 @@ class BrightnessGuard:
                     sleep_after_success = self.display_sleep_pending
                     self.display_sleep_pending = False
                     self.restore(sleep_after_success=sleep_after_success)
+
+            if self.post_wake_deadline is not None and now >= self.post_wake_deadline:
+                self.post_wake_deadline = None
+                if not self.tracker.active:
+                    self.verify_post_wake_restore()
 
             if now - last_server_check >= 5:
                 last_server_check = now
@@ -824,6 +1059,7 @@ class BrightnessGuard:
         self.follower.close()
         if self.load_state() is not None:
             self.restore()
+        self.stop_event_monitor()
         log_event("guard_stopped")
         return 0
 

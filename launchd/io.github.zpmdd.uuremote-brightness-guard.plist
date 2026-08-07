@@ -32,6 +32,10 @@
         <string>true</string>
         <key>UURBG_DISPLAY_SLEEP_DELAY</key>
         <string>1.0</string>
+        <key>UURBG_POST_WAKE_DELAY</key>
+        <string>4.0</string>
+        <key>UURBG_POST_WAKE_RETRY</key>
+        <string>3.0</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

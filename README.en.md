@@ -19,7 +19,7 @@ A small macOS LaunchAgent that automatically dims every display when this Mac be
 - Uses a safe fallback when a display's original value cannot be read: MonitorControl-style 85%, mapped to 70% raw DDC for external displays.
 - When MonitorControl is installed and running, pauses it only while brightness is being changed, preventing its synchronization loop from overwriting per-display values.
 - Handles stale state after a Mac or monitor restart and retries a failed restore.
-- Sleeps only the displays one second after a successful disconnect restore. Keyboard or mouse input wakes them at the restored brightness.
+- Sleeps only the displays one second after a successful disconnect restore, then verifies hardware brightness and gamma after wake and automatically repairs any mismatch.
 - Runs locally, without `sudo`, accounts, cloud services, or network requests.
 
 ```mermaid
@@ -29,6 +29,7 @@ flowchart LR
     C --> D[Last session disconnects]
     D --> E[Restore saved values]
     E --> F[Sleep displays only]
+    F --> G[Verify after wake and repair if needed]
 ```
 
 ## Requirements
@@ -103,7 +104,9 @@ The Swift helper uses:
 - DDC/CI VCP code `0x10` for external hardware brightness;
 - CoreGraphics gamma tables for the final near-black output and exact gamma restoration.
 
-The snapshot and state files use mode `0600` and contain brightness values and transient display identifiers only. They do not store display names, serial numbers, UU accounts, remote device IDs, or network addresses. Successful restoration deletes the snapshot.
+When display sleep is enabled, the guard retains the snapshot and listens for macOS display sleep/wake events. Four seconds after wake it reads built-in brightness, external DDC values, and external gamma tables. If MonitorControl shows the expected percentage while the picture is still too dark, the guard reapplies the snapshot and verifies again. Failed verification is retried every three seconds.
+
+The snapshot and state files use mode `0600` and contain brightness values and transient display identifiers only. They do not store display names, serial numbers, UU accounts, remote device IDs, or network addresses. Without display sleep the snapshot is deleted after restoration; with display sleep it is deleted only after successful post-wake verification.
 
 ## Configuration
 
@@ -117,6 +120,8 @@ Defaults live in `launchd/io.github.zpmdd.uuremote-brightness-guard.plist`:
 | `UURBG_DDC_FALLBACK` | `0.70` | Raw external DDC fallback corresponding to combined 85% in the tested MonitorControl setup. |
 | `UURBG_SLEEP_AFTER_DISCONNECT` | `true` | Sleep displays after a successful disconnect restore. |
 | `UURBG_DISPLAY_SLEEP_DELAY` | `1.0` | Delay before `pmset displaysleepnow`. |
+| `UURBG_POST_WAKE_DELAY` | `4.0` | Delay after a display wake event before verification. |
+| `UURBG_POST_WAKE_RETRY` | `3.0` | Retry interval after unsuccessful post-wake verification or repair. |
 
 Advanced users can edit these string values in the template and rerun `./install.sh`. Values are clamped by the guard where appropriate.
 
