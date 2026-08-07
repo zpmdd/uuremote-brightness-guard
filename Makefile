@@ -9,7 +9,7 @@ build:
 	/bin/mkdir -p bin
 	$(SWIFTC) -O -sdk "$(SDK)" \
 		-import-objc-header src/Bridging-Header.h \
-		-framework CoreGraphics -framework IOKit \
+		-framework AppKit -framework CoreGraphics -framework IOKit \
 		-F /System/Library/PrivateFrameworks -framework DisplayServices \
 		src/DisplayBrightnessTool.swift -o $(HELPER)
 

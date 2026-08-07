@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Dispatch
 import Foundation
@@ -59,6 +60,21 @@ private struct CommandResult: Codable {
 private struct RuntimeDDCService {
   let slot: Int
   let service: IOAVService?
+}
+
+private struct ScreenEvent: Codable {
+  let action: String
+  let event: String
+}
+
+private final class ScreenEventObserver: NSObject {
+  @objc func screensDidSleep(_ notification: Notification) {
+    emitScreenEvent("sleep")
+  }
+
+  @objc func screensDidWake(_ notification: Notification) {
+    emitScreenEvent("wake")
+  }
 }
 
 private enum ToolError: Error, CustomStringConvertible {
@@ -468,8 +484,14 @@ private func restore(
   }
 
   let externalDisplays = displays.enumerated().filter { CGDisplayIsBuiltin($0.element) == 0 }
+  let gammaTopologyMatches = externalDisplays.count == snapshot.gamma.count
   for (slot, displayID) in externalDisplays {
-    let saved = snapshot.gamma.first(where: { $0.displayID == displayID })
+    let saved = gammaForDisplay(
+      snapshot: snapshot,
+      displayID: displayID,
+      slot: slot,
+      topologyMatches: gammaTopologyMatches
+    )
     let item = saved ?? linearGamma(displayID: displayID, slot: slot)
     let applied = applyGamma(item, factor: 1)
     gammaResults.append(TargetResult(
@@ -498,6 +520,157 @@ private func restore(
   )
 }
 
+private func gammaPeak(_ snapshot: GammaSnapshot) -> Float {
+  max(
+    max(snapshot.red.max() ?? 0, snapshot.green.max() ?? 0),
+    snapshot.blue.max() ?? 0
+  )
+}
+
+private func gammaForDisplay(
+  snapshot: BrightnessSnapshot,
+  displayID: CGDirectDisplayID,
+  slot: Int,
+  topologyMatches: Bool
+) -> GammaSnapshot? {
+  let saved = snapshot.gamma.first(where: { $0.displayID == displayID })
+    ?? (topologyMatches ? snapshot.gamma.first(where: { $0.slot == slot }) : nil)
+  guard let saved else { return nil }
+  return GammaSnapshot(
+    slot: slot,
+    displayID: displayID,
+    sampleCount: saved.sampleCount,
+    red: saved.red,
+    green: saved.green,
+    blue: saved.blue,
+    captured: saved.captured
+  )
+}
+
+private func gammaMatches(_ current: GammaSnapshot, _ expected: GammaSnapshot) -> Bool {
+  guard current.sampleCount == expected.sampleCount,
+        current.red.count == expected.red.count,
+        current.green.count == expected.green.count,
+        current.blue.count == expected.blue.count
+  else { return false }
+  let tolerance: Float = 0.01
+  for index in current.red.indices {
+    if abs(current.red[index] - expected.red[index]) > tolerance
+      || abs(current.green[index] - expected.green[index]) > tolerance
+      || abs(current.blue[index] - expected.blue[index]) > tolerance
+    {
+      return false
+    }
+  }
+  return true
+}
+
+private func verify(
+  snapshot: BrightnessSnapshot,
+  fallback: Float,
+  ddcFallback: Float
+) throws -> CommandResult {
+  let clampedFallback = max(0, min(1, fallback))
+  let clampedDDCFallback = max(0, min(1, ddcFallback))
+  let displays = try onlineDisplayIDs()
+  let nativeDisplays = displays.enumerated().filter { CGDisplayIsBuiltin($0.element) != 0 }
+  let nativeTopologyMatches = nativeDisplays.count == snapshot.native.count
+  var nativeResults: [TargetResult] = []
+  var gammaResults: [TargetResult] = []
+  var ddcResults: [TargetResult] = []
+  var warnings: [String] = []
+
+  for (slot, displayID) in nativeDisplays {
+    let saved = snapshot.native.first(where: { $0.displayID == displayID })?.value
+    let expected = saved ?? clampedFallback
+    var observed: Float = 0
+    let readable = DisplayServicesGetBrightness(displayID, &observed) == 0
+    let matches = readable && abs(observed - expected) <= 0.02
+    nativeResults.append(TargetResult(
+      target: "native-\(slot)",
+      readable: readable,
+      requested: Double(expected),
+      observed: readable ? Double(observed) : nil,
+      applied: matches,
+      fallbackUsed: saved == nil,
+      detail: matches ? nil : "native verification mismatch"
+    ))
+    if !matches { warnings.append("native-\(slot) verification mismatch") }
+  }
+
+  let services = discoverDDCServices()
+  let topologyMatches = services.count == snapshot.ddc.count
+  for service in services {
+    let saved = topologyMatches ? snapshot.ddc.first(where: { $0.slot == service.slot }) : nil
+    let live = readDDCBrightness(service.service)
+    let maximum = saved?.maximum ?? live?.maximum ?? 100
+    let expected: UInt16
+    let useFallback: Bool
+    if let current = saved?.current, saved?.maximum != nil {
+      expected = min(current, maximum)
+      useFallback = false
+    } else {
+      expected = UInt16((Double(maximum) * Double(clampedDDCFallback)).rounded())
+      useFallback = true
+    }
+    let matches = live.map { abs(Int($0.current) - Int(expected)) <= 1 } ?? false
+    ddcResults.append(TargetResult(
+      target: "ddc-\(service.slot)",
+      readable: live != nil,
+      requested: Double(expected) / Double(maximum),
+      observed: live.map { Double($0.current) / Double($0.maximum) },
+      applied: matches,
+      fallbackUsed: useFallback,
+      detail: matches ? nil : "DDC verification mismatch"
+    ))
+    if !matches { warnings.append("ddc-\(service.slot) verification mismatch") }
+  }
+
+  let externalDisplays = displays.enumerated().filter { CGDisplayIsBuiltin($0.element) == 0 }
+  let gammaTopologyMatches = externalDisplays.count == snapshot.gamma.count
+  for (slot, displayID) in externalDisplays {
+    let saved = gammaForDisplay(
+      snapshot: snapshot,
+      displayID: displayID,
+      slot: slot,
+      topologyMatches: gammaTopologyMatches
+    )
+    let expected = saved ?? linearGamma(displayID: displayID, slot: slot)
+    let current = captureGamma(displayID: displayID, slot: slot)
+    let matches = current.map { gammaMatches($0, expected) } ?? false
+    gammaResults.append(TargetResult(
+      target: "gamma-\(slot)",
+      readable: current != nil,
+      requested: Double(gammaPeak(expected)),
+      observed: current.map { Double(gammaPeak($0)) },
+      applied: matches,
+      fallbackUsed: saved == nil || saved?.captured == false,
+      detail: matches ? nil : "gamma verification mismatch"
+    ))
+    if !matches { warnings.append("gamma-\(slot) verification mismatch") }
+  }
+
+  if !nativeTopologyMatches { warnings.append("native display topology mismatch") }
+  if !topologyMatches { warnings.append("DDC display topology mismatch") }
+  if !gammaTopologyMatches { warnings.append("external display topology mismatch") }
+
+  let changedCount = nativeResults.count + gammaResults.count + ddcResults.count
+  return CommandResult(
+    action: "verify",
+    success: changedCount > 0
+      && nativeTopologyMatches
+      && topologyMatches
+      && gammaTopologyMatches
+      && !nativeResults.contains(where: { !$0.applied })
+      && !ddcResults.contains(where: { !$0.applied })
+      && !gammaResults.contains(where: { !$0.applied }),
+    native: nativeResults,
+    gamma: gammaResults,
+    ddc: ddcResults,
+    warnings: warnings
+  )
+}
+
 private func probe() throws -> CommandResult {
   let snapshot = try captureSnapshot()
   let native = snapshot.native.map { item in
@@ -516,7 +689,7 @@ private func probe() throws -> CommandResult {
       target: "gamma-\(item.slot)",
       readable: item.captured != false,
       requested: nil,
-      observed: nil,
+      observed: Double(gammaPeak(item)),
       applied: false,
       fallbackUsed: item.captured == false,
       detail: "\(item.sampleCount) finite samples"
@@ -570,6 +743,47 @@ private func processExists(_ pid: pid_t) -> Bool {
   guard pid > 1 else { return true }
   if kill(pid, 0) == 0 { return true }
   return errno == EPERM
+}
+
+private func emitScreenEvent(_ event: String) {
+  let payload = ScreenEvent(action: "events", event: event)
+  guard let data = try? JSONEncoder().encode(payload) else { return }
+  FileHandle.standardOutput.write(data)
+  FileHandle.standardOutput.write(Data("\n".utf8))
+}
+
+private func displaysAreAsleep() -> Bool? {
+  guard let displays = try? onlineDisplayIDs(), !displays.isEmpty else { return nil }
+  return displays.allSatisfy { CGDisplayIsAsleep($0) != 0 }
+}
+
+private func monitorScreenEvents(parentPID: pid_t) {
+  let observer = ScreenEventObserver()
+  let center = NSWorkspace.shared.notificationCenter
+  center.addObserver(
+    observer,
+    selector: #selector(ScreenEventObserver.screensDidSleep(_:)),
+    name: NSWorkspace.screensDidSleepNotification,
+    object: nil
+  )
+  center.addObserver(
+    observer,
+    selector: #selector(ScreenEventObserver.screensDidWake(_:)),
+    name: NSWorkspace.screensDidWakeNotification,
+    object: nil
+  )
+  defer { center.removeObserver(observer) }
+
+  emitScreenEvent("ready")
+  var lastPolledState = displaysAreAsleep()
+  while processExists(parentPID) {
+    RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+    let currentState = displaysAreAsleep()
+    if let currentState, let previousState = lastPolledState, currentState != previousState {
+      emitScreenEvent(currentState ? "sleep" : "wake")
+    }
+    lastPolledState = currentState
+  }
 }
 
 private func holdDimmed(
@@ -629,12 +843,15 @@ private func holdDimmed(
 private func run() throws {
   let arguments = Array(CommandLine.arguments.dropFirst())
   guard let command = arguments.first else {
-    throw ToolError.usage("Usage: DisplayBrightnessTool probe | dim --snapshot PATH [--dim-factor 0.0] | hold --snapshot PATH [--reuse-snapshot] [--parent-pid PID] [--fallback 0.85] [--ddc-fallback 0.70] | restore --snapshot PATH [--fallback 0.85] [--ddc-fallback 0.70] | fallback [--value 0.85] [--ddc-value 0.70]")
+    throw ToolError.usage("Usage: DisplayBrightnessTool probe | events [--parent-pid PID] | dim --snapshot PATH [--dim-factor 0.0] | hold --snapshot PATH [--reuse-snapshot] [--parent-pid PID] [--fallback 0.85] [--ddc-fallback 0.70] | restore --snapshot PATH [--fallback 0.85] [--ddc-fallback 0.70] | verify --snapshot PATH [--fallback 0.85] [--ddc-fallback 0.70] | fallback [--value 0.85] [--ddc-value 0.70]")
   }
 
   switch command {
   case "probe":
     try emit(probe())
+  case "events":
+    let parentPID = pid_t(argument("--parent-pid", in: arguments) ?? "0") ?? 0
+    monitorScreenEvents(parentPID: parentPID)
   case "dim":
     guard let path = argument("--snapshot", in: arguments) else {
       throw ToolError.usage("dim requires --snapshot PATH")
@@ -667,6 +884,17 @@ private func run() throws {
     let fallback = Float(argument("--fallback", in: arguments) ?? "0.85") ?? 0.85
     let ddcFallback = Float(argument("--ddc-fallback", in: arguments) ?? "0.70") ?? 0.70
     try emit(restore(
+      snapshot: loadSnapshot(path: path),
+      fallback: fallback,
+      ddcFallback: ddcFallback
+    ))
+  case "verify":
+    guard let path = argument("--snapshot", in: arguments) else {
+      throw ToolError.usage("verify requires --snapshot PATH")
+    }
+    let fallback = Float(argument("--fallback", in: arguments) ?? "0.85") ?? 0.85
+    let ddcFallback = Float(argument("--ddc-fallback", in: arguments) ?? "0.70") ?? 0.70
+    try emit(verify(
       snapshot: loadSnapshot(path: path),
       fallback: fallback,
       ddcFallback: ddcFallback

@@ -21,6 +21,29 @@ function cleanup_build_dir() {
 }
 trap cleanup_build_dir EXIT
 
+function wait_until_agent_is_unloaded() {
+  local attempt
+  for attempt in {1..50}; do
+    if ! /bin/launchctl print "${DOMAIN}/${LABEL}" >/dev/null 2>&1; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
+function bootstrap_agent() {
+  local plist_path="$1"
+  local attempt
+  for attempt in {1..3}; do
+    if /bin/launchctl bootstrap "${DOMAIN}" "${plist_path}"; then
+      return 0
+    fi
+    /bin/sleep 0.5
+  done
+  return 1
+}
+
 if [[ "$(/usr/bin/uname -m)" != "arm64" ]]; then
   print -u2 -- "This release currently supports Apple Silicon Macs only."
   exit 1
@@ -50,6 +73,7 @@ print -- "Building the local display helper..."
   -O \
   -sdk "$(/usr/bin/xcrun --sdk macosx --show-sdk-path)" \
   -import-objc-header "${SCRIPT_DIR}/src/Bridging-Header.h" \
+  -framework AppKit \
   -framework CoreGraphics \
   -framework IOKit \
   -F /System/Library/PrivateFrameworks \
@@ -88,13 +112,17 @@ if [[ -f "${TARGET_PLIST}" ]]; then
 fi
 
 /bin/launchctl bootout "${DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
+if ! wait_until_agent_is_unloaded; then
+  print -u2 -- "The previous LaunchAgent did not finish stopping. Its configuration was not replaced."
+  exit 1
+fi
 /usr/bin/install -m 0644 "${BUILD_DIR}/${LABEL}.plist" "${TARGET_PLIST}"
 
-if ! /bin/launchctl bootstrap "${DOMAIN}" "${TARGET_PLIST}"; then
+if ! bootstrap_agent "${TARGET_PLIST}"; then
   print -u2 -- "The LaunchAgent could not be loaded. Rolling back the previous agent."
   if [[ -f "${BUILD_DIR}/previous.plist" ]]; then
     /usr/bin/install -m 0644 "${BUILD_DIR}/previous.plist" "${TARGET_PLIST}"
-    /bin/launchctl bootstrap "${DOMAIN}" "${TARGET_PLIST}" >/dev/null 2>&1 || true
+    bootstrap_agent "${TARGET_PLIST}" >/dev/null 2>&1 || true
   fi
   exit 1
 fi

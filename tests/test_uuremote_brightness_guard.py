@@ -141,7 +141,10 @@ class DisplaySleepTests(unittest.TestCase):
             guard, original = self.make_guard(temporary)
             try:
                 completed = MODULE.subprocess.CompletedProcess([], 0, "", "")
-                with patch.object(MODULE.subprocess, "run", return_value=completed) as mocked:
+                with (
+                    patch.object(guard, "start_event_monitor", return_value=True),
+                    patch.object(MODULE.subprocess, "run", return_value=completed) as mocked,
+                ):
                     self.assertTrue(guard.request_display_sleep())
                 mocked.assert_called_once_with(
                     ["/usr/bin/pmset", "displaysleepnow"],
@@ -177,7 +180,117 @@ class DisplaySleepTests(unittest.TestCase):
                 with patch.object(guard, "request_display_sleep", return_value=True) as requested:
                     self.assertTrue(guard.restore(sleep_after_success=True))
                 requested.assert_called_once_with()
+                self.assertTrue(guard.snapshot_file.exists())
+                state = guard.load_state()
+                self.assertIsNotNone(state)
+                self.assertEqual(state["phase"], "awaiting-display-wake")
+            finally:
+                self.restore_environment(original)
+
+    def test_failed_display_sleep_clears_an_already_restored_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                guard.snapshot_file.write_text("{}", encoding="utf-8")
+                guard.stop_holder = lambda _state: None
+                guard.helper_call = lambda _arguments: (True, {"success": True})
+                with patch.object(guard, "request_display_sleep", return_value=False):
+                    self.assertTrue(guard.restore(sleep_after_success=True))
                 self.assertFalse(guard.snapshot_file.exists())
+                self.assertIsNone(guard.load_state())
+            finally:
+                self.restore_environment(original)
+
+
+class PostWakeVerificationTests(unittest.TestCase):
+    def make_guard(self, temporary):
+        original = MODULE.os.environ.get("UURBG_STATE_DIR")
+        MODULE.os.environ["UURBG_STATE_DIR"] = temporary
+        guard = MODULE.BrightnessGuard()
+        guard.post_wake_delay = 0
+        guard.post_wake_retry = 0
+        guard.snapshot_file.write_text("{}", encoding="utf-8")
+        guard.save_state({
+            "phase": "awaiting-display-wake",
+            "bootEpoch": guard.boot_epoch,
+            "pausedMonitorControlPids": [],
+        })
+        return guard, original
+
+    def restore_environment(self, original):
+        if original is None:
+            MODULE.os.environ.pop("UURBG_STATE_DIR", None)
+        else:
+            MODULE.os.environ["UURBG_STATE_DIR"] = original
+
+    def test_wake_event_schedules_verification_and_preserves_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                guard.handle_display_event("wake")
+                state = guard.load_state()
+                self.assertIsNotNone(state)
+                self.assertEqual(state["phase"], "post-wake-verification-pending")
+                self.assertIsNotNone(guard.post_wake_deadline)
+                self.assertTrue(guard.snapshot_file.exists())
+            finally:
+                self.restore_environment(original)
+
+    def test_matching_brightness_clears_snapshot_without_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                actions = []
+
+                def helper_call(arguments):
+                    actions.append(arguments[0])
+                    return True, {"success": True}
+
+                guard.helper_call = helper_call
+                self.assertTrue(guard.verify_post_wake_restore())
+                self.assertEqual(actions, ["verify"])
+                self.assertFalse(guard.snapshot_file.exists())
+                self.assertIsNone(guard.load_state())
+            finally:
+                self.restore_environment(original)
+
+    def test_mismatch_is_repaired_and_reverified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                results = iter([
+                    (False, {"success": False}),
+                    (True, {"success": True}),
+                    (True, {"success": True}),
+                ])
+                actions = []
+
+                def helper_call(arguments):
+                    actions.append(arguments[0])
+                    return next(results)
+
+                guard.helper_call = helper_call
+                with patch.object(MODULE.time, "sleep"):
+                    self.assertTrue(guard.verify_post_wake_restore())
+                self.assertEqual(actions, ["verify", "restore", "verify"])
+                self.assertFalse(guard.snapshot_file.exists())
+                self.assertIsNone(guard.load_state())
+            finally:
+                self.restore_environment(original)
+
+    def test_persistent_mismatch_keeps_snapshot_for_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                guard.helper_call = lambda _arguments: (False, {"success": False})
+                with patch.object(MODULE.time, "sleep"):
+                    self.assertFalse(guard.verify_post_wake_restore())
+                state = guard.load_state()
+                self.assertIsNotNone(state)
+                self.assertEqual(state["phase"], "post-wake-repair-pending")
+                self.assertEqual(state["postWakeAttempts"], 1)
+                self.assertTrue(guard.snapshot_file.exists())
+                self.assertIsNotNone(guard.post_wake_deadline)
             finally:
                 self.restore_environment(original)
 
