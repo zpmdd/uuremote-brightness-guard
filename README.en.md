@@ -12,7 +12,7 @@ A small macOS LaunchAgent that automatically dims every display when this Mac be
 
 ## Features
 
-- Detects remote connect/disconnect events from the local UU server process's live session channels, without depending on log formats.
+- Treats a session as connected only when macOS records `UURemoteServer` starting real screen capture; background network and display-sleep-prevention activity cannot trigger dimming.
 - Saves brightness separately for the built-in display and every external display.
 - Dims external monitors to hardware 0% through DDC/CI, then holds their gamma at 0 for a near-black physical output.
 - Restores the captured values after the final session disconnects, with a two-second debounce for connection glitches.
@@ -96,7 +96,7 @@ Do not disconnect, power-cycle, or rearrange monitors while testing an active di
 
 ## How it works
 
-The Python guard uses the native macOS process interface to observe UDP session channels owned by `UURemoteServer`: a channel appearing means remote control started, and all channels closing means it ended. MonitorControl is not called to change brightness; when present, its process is paused briefly only to avoid conflicting writes.
+The Python guard follows the ScreenCaptureKit `SCStream` lifecycle recorded by macOS. Dimming starts only after a `UURemoteServer` capture object starts, and disconnect is reported only after every capture stream stops. Ordinary UDP/TCP traffic and UU's own background sleep-prevention activity cannot trigger dimming. macOS power assertions are used only as a negative safety check: a missing assertion, a stopped listener, or a persistently unreadable state can restore brightness but can never start dimming. MonitorControl is not called to change brightness; when present, its process is paused briefly only to avoid conflicting writes.
 
 The Swift helper uses:
 
@@ -138,7 +138,8 @@ The display helper uses macOS private frameworks and is compiled locally rather 
 ## Limitations
 
 - Apple Silicon only in the current release.
-- UU Remote does not publish an API for inbound sessions; if its network-session implementation changes, this project may need an update.
+- UU Remote does not publish an API for inbound sessions. If its ScreenCaptureKit events or display-sleep assertion change, the project safely leaves or restores displays bright, but may miss automatic dimming until the detector is updated.
+- If the guard restarts in the middle of a remote session, it prioritizes restoring brightness and waits for the next connection instead of replaying historical events to dim again.
 - DDC/CI behavior depends on the monitor, input, cable, dock, and macOS release.
 - External displays are matched by the runtime topology/slot order because the low-level service does not expose a stable public identifier.
 - MonitorControl is not required for a built-in-only setup. External-display use without it is possible but has less convenient compatibility testing and manual recovery.

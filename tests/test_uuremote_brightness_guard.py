@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "uuremote_brightness_guard.py"
@@ -15,42 +15,103 @@ SPEC.loader.exec_module(MODULE)
 
 
 class SessionDetectionTests(unittest.TestCase):
-    def test_udp_socket_presence_drives_connect_and_disconnect_transitions(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            original = os.environ.get("UURBG_STATE_DIR")
-            os.environ["UURBG_STATE_DIR"] = temporary
-            try:
-                guard = MODULE.BrightnessGuard()
-                guard.server_pids = [123]
-                guard.next_server_pid_refresh = float("inf")
-                with patch.object(guard, "process_udp_socket_count", side_effect=[0, 8, 8, 0]):
-                    self.assertIsNone(guard.update_session())
-                    self.assertEqual(guard.update_session(), (False, True))
-                    self.assertIsNone(guard.update_session())
-                    self.assertEqual(guard.update_session(), (True, False))
-            finally:
-                if original is None:
-                    os.environ.pop("UURBG_STATE_DIR", None)
-                else:
-                    os.environ["UURBG_STATE_DIR"] = original
+    IDLE_ASSERTIONS = '''
+Assertion status system-wide:
+   UserIsActive                   1
+   PreventUserIdleDisplaySleep    0
+Listed by owning process:
+   pid 123(UURemoteServer): [0x1] 00:00:01 UserIsActive named: "Wake Up Display"
+   pid 124(UURemote): [0x2] 01:00:00 PreventUserIdleSystemSleep named: "UURemote Disable Idle System Sleep"
+'''
+    ACTIVE_ASSERTIONS = IDLE_ASSERTIONS + '''
+   pid 123(UURemoteServer): [0x3] 00:00:02 PreventUserIdleDisplaySleep named: "idleDisplaySleepDisabled"
+'''
 
-    def test_probe_failure_keeps_last_known_session_state(self):
+    def make_guard(self, temporary):
+        original = os.environ.get("UURBG_STATE_DIR")
+        os.environ["UURBG_STATE_DIR"] = temporary
+        return MODULE.BrightnessGuard(), original
+
+    def restore_environment(self, original):
+        if original is None:
+            os.environ.pop("UURBG_STATE_DIR", None)
+        else:
+            os.environ["UURBG_STATE_DIR"] = original
+
+    @staticmethod
+    def payload(message):
+        return {
+            "processID": 123,
+            "processImagePath": MODULE.UU_SERVER_EXECUTABLE,
+            "senderImagePath": MODULE.SCREEN_CAPTURE_SENDER,
+            "eventMessage": message,
+        }
+
+    def test_only_screen_capture_events_activate_a_session(self):
         with tempfile.TemporaryDirectory() as temporary:
-            original = os.environ.get("UURBG_STATE_DIR")
-            os.environ["UURBG_STATE_DIR"] = temporary
+            guard, original = self.make_guard(temporary)
             try:
-                guard = MODULE.BrightnessGuard()
-                guard.session_active = True
-                guard.server_pids = [123]
-                guard.next_server_pid_refresh = float("inf")
-                with patch.object(guard, "process_udp_socket_count", return_value=None):
-                    self.assertIsNone(guard.update_session())
-                self.assertTrue(guard.session_active)
+                start_a = " [INFO] -[SCStream startCaptureWithCompletionHandler:]:816 0xaaa streamID=<private>"
+                start_b = " [INFO] -[SCStream startCaptureWithCompletionHandler:]:816 0xbbb streamID=<private>"
+                stop_a = " [INFO] -[SCStream stopCaptureWithCompletionHandler:]:852 0xaaa streamID=<private>"
+                dealloc_b = " [INFO] -[SCStream dealloc]:589 0xbbb streamID=<private>"
+
+                self.assertEqual(guard.handle_session_log_payload(self.payload(start_a)), (False, True))
+                self.assertIsNone(guard.handle_session_log_payload(self.payload(start_b)))
+                self.assertIsNone(guard.handle_session_log_payload(self.payload(stop_a)))
+                self.assertEqual(guard.handle_session_log_payload(self.payload(dealloc_b)), (True, False))
+                self.assertIsNone(guard.handle_session_log_payload(self.payload(dealloc_b)))
             finally:
-                if original is None:
-                    os.environ.pop("UURBG_STATE_DIR", None)
-                else:
-                    os.environ["UURBG_STATE_DIR"] = original
+                self.restore_environment(original)
+
+    def test_power_assertion_is_negative_only_and_strictly_matched(self):
+        self.assertEqual(MODULE.BrightnessGuard.parse_session_assertion_pids(self.IDLE_ASSERTIONS), set())
+        self.assertEqual(MODULE.BrightnessGuard.parse_session_assertion_pids(self.ACTIVE_ASSERTIONS), {123})
+        wrong_owner = self.ACTIVE_ASSERTIONS.replace("UURemoteServer", "AnotherProcess")
+        self.assertEqual(MODULE.BrightnessGuard.parse_session_assertion_pids(wrong_owner), set())
+        self.assertIsNone(MODULE.BrightnessGuard.parse_session_assertion_pids("unexpected output"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                with patch.object(guard, "observe_session_assertion_pids", return_value={123}) as probe:
+                    self.assertIsNone(guard.poll_session_assertion(10))
+                probe.assert_not_called()
+                self.assertFalse(guard.session_active)
+            finally:
+                self.restore_environment(original)
+
+    def test_missing_assertion_eventually_fails_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                guard.session_active = True
+                guard.active_streams.add((123, "0xaaa"))
+                guard.disconnect_grace = 2
+                with patch.object(guard, "observe_session_assertion_pids", return_value=None):
+                    self.assertIsNone(guard.poll_session_assertion(10))
+                    self.assertIsNone(guard.poll_session_assertion(11))
+                    self.assertEqual(guard.poll_session_assertion(12), (True, False))
+                self.assertFalse(guard.session_active)
+            finally:
+                self.restore_environment(original)
+
+    def test_stopped_session_monitor_fails_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            guard, original = self.make_guard(temporary)
+            try:
+                guard.session_active = True
+                guard.active_streams.add((123, "0xaaa"))
+                process = MagicMock()
+                process.stdout.readline.return_value = b""
+                process.poll.return_value = 1
+                process.returncode = 1
+                guard.session_monitor_process = process
+                with patch.object(MODULE.select, "select", return_value=([process.stdout], [], [])):
+                    self.assertEqual(guard.poll_session_events(), [(True, False)])
+                self.assertFalse(guard.session_active)
+            finally:
+                self.restore_environment(original)
 
 
 class StateFileTests(unittest.TestCase):
