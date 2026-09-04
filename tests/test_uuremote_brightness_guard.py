@@ -14,74 +14,43 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
-class SessionTrackerTests(unittest.TestCase):
-    def test_only_real_connected_and_disconnected_lines_change_state(self):
-        tracker = MODULE.SessionTracker()
-        connected = (
-            "onPeerConnectionState(UUXPC.XPCPeerConnectionState(handle: 5, "
-            "state: UUXPC.XPCPeerConnectionState.State.peerConnected))"
-        )
-        disconnected = (
-            "onPeerConnectionState(UUXPC.XPCPeerConnectionState(handle: 5, "
-            "state: UUXPC.XPCPeerConnectionState.State.disconnected))"
-        )
-
-        self.assertEqual(tracker.feed(connected), (False, True))
-        self.assertTrue(tracker.active)
-        self.assertIsNone(tracker.feed("PrivacyScreenManager- session connected"))
-        self.assertEqual(tracker.feed(disconnected), (True, False))
-        self.assertFalse(tracker.active)
-
-    def test_multiple_sessions_restore_only_after_last_disconnect(self):
-        tracker = MODULE.SessionTracker()
-        template = (
-            "onPeerConnectionState(UUXPC.XPCPeerConnectionState(handle: {handle}, "
-            "state: UUXPC.XPCPeerConnectionState.State.{state}))"
-        )
-        self.assertEqual(tracker.feed(template.format(handle=1, state="peerConnected")), (False, True))
-        self.assertIsNone(tracker.feed(template.format(handle=2, state="peerConnected")))
-        self.assertIsNone(tracker.feed(template.format(handle=1, state="disconnected")))
-        self.assertEqual(tracker.feed(template.format(handle=2, state="disconnected")), (True, False))
-
-
-class SessionReconstructionTests(unittest.TestCase):
-    def test_old_server_session_is_ignored_after_restart(self):
+class SessionDetectionTests(unittest.TestCase):
+    def test_udp_socket_presence_drives_connect_and_disconnect_transitions(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            log_dir = root / "logs"
-            log_dir.mkdir()
-            state_dir = root / "state"
-            current_log = log_dir / "UURemoteServer.log"
-            template = (
-                "[{timestamp} 909/1][info] "
-                "onPeerConnectionState(UUXPC.XPCPeerConnectionState(handle: {handle}, "
-                "state: UUXPC.XPCPeerConnectionState.State.{state}))\n"
-            )
-            current_log.write_text(
-                template.format(timestamp="08-06 21:43:03.000", handle=1, state="peerConnected")
-                + template.format(timestamp="08-06 21:49:42.000", handle=2, state="peerConnected")
-                + template.format(timestamp="08-06 21:53:41.000", handle=2, state="disconnected"),
-                encoding="utf-8",
-            )
-            original = {name: os.environ.get(name) for name in ("UURBG_STATE_DIR", "UURBG_LOG_DIR")}
-            os.environ["UURBG_STATE_DIR"] = str(state_dir)
-            os.environ["UURBG_LOG_DIR"] = str(log_dir)
+            original = os.environ.get("UURBG_STATE_DIR")
+            os.environ["UURBG_STATE_DIR"] = temporary
             try:
                 guard = MODULE.BrightnessGuard()
-                guard.boot_epoch = MODULE.log_line_epoch("[08-06 21:44:51.000 1/1]", None)
-                server_started = MODULE.log_line_epoch("[08-06 21:45:57.000 1/1]", None)
-                guard.process_start_epoch = lambda _executable: server_started
-                guard.reconstruct_sessions()
-                self.assertFalse(guard.tracker.active)
+                guard.server_pids = [123]
+                guard.next_server_pid_refresh = float("inf")
+                with patch.object(guard, "process_udp_socket_count", side_effect=[0, 8, 8, 0]):
+                    self.assertIsNone(guard.update_session())
+                    self.assertEqual(guard.update_session(), (False, True))
+                    self.assertIsNone(guard.update_session())
+                    self.assertEqual(guard.update_session(), (True, False))
             finally:
-                for name, value in original.items():
-                    if value is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = value
+                if original is None:
+                    os.environ.pop("UURBG_STATE_DIR", None)
+                else:
+                    os.environ["UURBG_STATE_DIR"] = original
 
-    def test_log_timestamp_parser_rejects_lines_without_timestamp(self):
-        self.assertIsNone(MODULE.log_line_epoch("onPeerConnectionState(...)", None))
+    def test_probe_failure_keeps_last_known_session_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            original = os.environ.get("UURBG_STATE_DIR")
+            os.environ["UURBG_STATE_DIR"] = temporary
+            try:
+                guard = MODULE.BrightnessGuard()
+                guard.session_active = True
+                guard.server_pids = [123]
+                guard.next_server_pid_refresh = float("inf")
+                with patch.object(guard, "process_udp_socket_count", return_value=None):
+                    self.assertIsNone(guard.update_session())
+                self.assertTrue(guard.session_active)
+            finally:
+                if original is None:
+                    os.environ.pop("UURBG_STATE_DIR", None)
+                else:
+                    os.environ["UURBG_STATE_DIR"] = original
 
 
 class StateFileTests(unittest.TestCase):
