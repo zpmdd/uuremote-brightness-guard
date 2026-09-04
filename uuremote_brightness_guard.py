@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import fcntl
 import json
 import os
@@ -12,13 +11,12 @@ from pathlib import Path
 import re
 import select
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 SCHEMA_VERSION = 1
@@ -26,40 +24,28 @@ MONITOR_CONTROL_EXECUTABLE = "/Applications/MonitorControl.app/Contents/MacOS/Mo
 MONITOR_CONTROL_BUNDLE_ID = "app.monitorcontrol.MonitorControl"
 UU_SERVER_EXECUTABLE = "/Applications/UURemote.app/Contents/Helpers/UURemoteServer"
 BOOT_TIME_RE = re.compile(r"sec\s*=\s*(\d+)")
-PROC_PIDLISTFDS = 1
-PROC_PIDFDSOCKETINFO = 3
-PROX_FDTYPE_SOCKET = 2
-# offsetof(socket_fdinfo, psi.soi_protocol) in the Apple Silicon macOS ABI.
-SOCKET_PROTOCOL_OFFSET = 180
-SOCKET_FDINFO_BUFFER_SIZE = 1024
+UU_SESSION_ASSERTION_RE = re.compile(
+    r'^\s*pid\s+(\d+)\(UURemoteServer\):.*\bPreventUserIdleDisplaySleep '
+    r'named: "idleDisplaySleepDisabled"\s*$',
+    re.MULTILINE,
+)
+SCSTREAM_EVENT_RE = re.compile(
+    r"-\[SCStream (startCaptureWithCompletionHandler|stopCaptureWithCompletionHandler|dealloc):?\]:"
+    r"\d+\s+(0x[0-9a-fA-F]+)\b"
+)
+SCREEN_CAPTURE_SENDER = "/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenCaptureKit"
+UU_SESSION_LOG_PREDICATE = (
+    'process == "UURemoteServer" AND senderImagePath CONTAINS "ScreenCaptureKit.framework" AND '
+    '(eventMessage CONTAINS "SCStream startCaptureWithCompletionHandler" OR '
+    'eventMessage CONTAINS "SCStream stopCaptureWithCompletionHandler" OR '
+    'eventMessage CONTAINS "SCStream dealloc")'
+)
+PMSET_ASSERTION_HEADERS = ("Assertion status system-wide:", "Listed by owning process:")
 POST_WAKE_PHASES = {
     "awaiting-display-wake",
     "post-wake-verification-pending",
     "post-wake-repair-pending",
 }
-
-
-class ProcFDInfo(ctypes.Structure):
-    _fields_ = [("fd", ctypes.c_int32), ("type", ctypes.c_uint32)]
-
-
-LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
-LIBPROC.proc_pidinfo.argtypes = [
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_uint64,
-    ctypes.c_void_p,
-    ctypes.c_int,
-]
-LIBPROC.proc_pidinfo.restype = ctypes.c_int
-LIBPROC.proc_pidfdinfo.argtypes = [
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_void_p,
-    ctypes.c_int,
-]
-LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
 
 
 def utc_now() -> str:
@@ -136,8 +122,11 @@ class BrightnessGuard:
         self.post_wake_retry = env_float("UURBG_POST_WAKE_RETRY", 3.0, 1.0, 60.0)
 
         self.session_active = False
-        self.server_pids: List[int] = []
-        self.next_server_pid_refresh = 0.0
+        self.active_streams: Set[Tuple[int, str]] = set()
+        self.session_monitor_process: Optional[subprocess.Popen] = None
+        self.last_session_monitor_attempt = 0.0
+        self.next_session_assertion_check = 0.0
+        self.session_assertion_missing_since: Optional[float] = None
         self.restore_deadline: Optional[float] = None
         self.post_wake_deadline: Optional[float] = None
         self.display_sleep_pending = False
@@ -206,71 +195,166 @@ class BrightnessGuard:
         return pids
 
     @staticmethod
-    def process_udp_socket_count(pid: int) -> Optional[int]:
-        needed = LIBPROC.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, None, 0)
-        if needed <= 0:
+    def parse_session_assertion_pids(output: str) -> Optional[Set[int]]:
+        if not all(header in output for header in PMSET_ASSERTION_HEADERS):
             return None
-        capacity = needed // ctypes.sizeof(ProcFDInfo) + 32
-        entries = (ProcFDInfo * capacity)()
-        used = LIBPROC.proc_pidinfo(
-            pid,
-            PROC_PIDLISTFDS,
-            0,
-            ctypes.byref(entries),
-            ctypes.sizeof(entries),
-        )
-        if used <= 0:
-            return None
+        return {int(match.group(1)) for match in UU_SESSION_ASSERTION_RE.finditer(output)}
 
-        count = 0
-        socket_info = ctypes.create_string_buffer(SOCKET_FDINFO_BUFFER_SIZE)
-        for entry in entries[: used // ctypes.sizeof(ProcFDInfo)]:
-            if entry.type != PROX_FDTYPE_SOCKET:
-                continue
-            detail_size = LIBPROC.proc_pidfdinfo(
-                pid,
-                entry.fd,
-                PROC_PIDFDSOCKETINFO,
-                socket_info,
-                len(socket_info),
+    def observe_session_assertion_pids(self) -> Optional[Set[int]]:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/pmset", "-g", "assertions"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
-            if detail_size < SOCKET_PROTOCOL_OFFSET + ctypes.sizeof(ctypes.c_int32):
-                continue
-            protocol = ctypes.c_int32.from_buffer(socket_info, SOCKET_PROTOCOL_OFFSET).value
-            if protocol == socket.IPPROTO_UDP:
-                count += 1
-        return count
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return self.parse_session_assertion_pids(result.stdout)
 
-    def observe_session(self) -> Optional[bool]:
-        now = time.monotonic()
-        if not self.server_pids and now >= self.next_server_pid_refresh:
-            self.server_pids = self.exact_process_pids(UU_SERVER_EXECUTABLE)
-            self.next_server_pid_refresh = now + 5
-        if not self.server_pids:
-            return False
-
-        observed = False
-        for pid in self.server_pids:
-            count = self.process_udp_socket_count(pid)
-            if count is None:
-                continue
-            observed = True
-            if count > 0:
-                return True
-        if observed:
-            return False
-
-        self.server_pids = []
-        self.next_server_pid_refresh = 0
-        return None
-
-    def update_session(self) -> Optional[Tuple[bool, bool]]:
-        observed = self.observe_session()
-        if observed is None or observed == self.session_active:
+    def set_session_active(self, active: bool) -> Optional[Tuple[bool, bool]]:
+        if active == self.session_active:
             return None
         previous = self.session_active
-        self.session_active = observed
-        return previous, observed
+        self.session_active = active
+        return previous, active
+
+    def handle_session_log_payload(self, payload: object) -> Optional[Tuple[bool, bool]]:
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("processImagePath") != UU_SERVER_EXECUTABLE:
+            return None
+        if payload.get("senderImagePath") != SCREEN_CAPTURE_SENDER:
+            return None
+        message = payload.get("eventMessage")
+        if not isinstance(message, str):
+            return None
+        match = SCSTREAM_EVENT_RE.search(message)
+        if not match:
+            return None
+        try:
+            key = int(payload["processID"]), match.group(2)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        action = match.group(1)
+        if action == "startCaptureWithCompletionHandler":
+            self.active_streams.add(key)
+            self.session_assertion_missing_since = None
+        else:
+            self.active_streams.discard(key)
+        return self.set_session_active(bool(self.active_streams))
+
+    def session_monitor_is_alive(self) -> bool:
+        process = self.session_monitor_process
+        return process is not None and process.poll() is None
+
+    def start_session_monitor(self) -> bool:
+        if self.session_monitor_is_alive():
+            return True
+        self.last_session_monitor_attempt = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                [
+                    "/usr/bin/log",
+                    "stream",
+                    "--style",
+                    "ndjson",
+                    "--level",
+                    "info",
+                    "--predicate",
+                    UU_SESSION_LOG_PREDICATE,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except OSError as exc:
+            log_event("session_monitor_failed", reason=type(exc).__name__)
+            return False
+
+        assert process.stdout is not None
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        banner = process.stdout.readline() if ready else b""
+        if process.poll() is not None or not banner.startswith(b"Filtering the log data using"):
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            log_event("session_monitor_failed", reason="invalid-readiness")
+            return False
+        self.session_monitor_process = process
+        log_event("session_monitor_started")
+        return True
+
+    def stop_session_monitor(self) -> None:
+        process = self.session_monitor_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        self.session_monitor_process = None
+
+    def force_session_inactive(self) -> Optional[Tuple[bool, bool]]:
+        self.active_streams.clear()
+        self.session_assertion_missing_since = None
+        return self.set_session_active(False)
+
+    def poll_session_events(self) -> List[Tuple[bool, bool]]:
+        transitions: List[Tuple[bool, bool]] = []
+        process = self.session_monitor_process
+        if process is None:
+            return transitions
+        assert process.stdout is not None
+        while True:
+            ready, _, _ = select.select([process.stdout], [], [], 0)
+            if not ready:
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            transition = self.handle_session_log_payload(payload)
+            if transition is not None:
+                transitions.append(transition)
+        if process.poll() is not None:
+            log_event("session_monitor_stopped", exitCode=process.returncode)
+            self.session_monitor_process = None
+            transition = self.force_session_inactive()
+            if transition is not None:
+                transitions.append(transition)
+        return transitions
+
+    def poll_session_assertion(self, now: float) -> Optional[Tuple[bool, bool]]:
+        if not self.session_active:
+            self.session_assertion_missing_since = None
+            return None
+        if now < self.next_session_assertion_check:
+            return None
+        self.next_session_assertion_check = now + 1.0
+        assertion_pids = self.observe_session_assertion_pids()
+        active_pids = {pid for pid, _pointer in self.active_streams}
+        if assertion_pids is not None and active_pids & assertion_pids:
+            self.session_assertion_missing_since = None
+            return None
+        if self.session_assertion_missing_since is None:
+            self.session_assertion_missing_since = now
+            return None
+        if now - self.session_assertion_missing_since < self.disconnect_grace:
+            return None
+        log_event("session_assertion_lost", probeAvailable=assertion_pids is not None)
+        return self.force_session_inactive()
 
     def state_is_stale(self, state: Dict[str, object]) -> bool:
         saved = state.get("bootEpoch")
@@ -881,12 +965,10 @@ class BrightnessGuard:
         return success
 
     def status(self) -> Dict[str, object]:
-        observed = self.observe_session()
-        if observed is not None:
-            self.session_active = observed
         state = self.load_state()
+        active = bool(state and state.get("phase") in {"engaging", "dimmed"})
         return {
-            "activeSessions": int(self.session_active),
+            "activeSessions": int(active),
             "dimmed": bool(state and state.get("phase") in {"engaging", "dimmed", "restore-pending"}),
             "phase": state.get("phase") if state else "idle",
             "snapshotExists": self.snapshot_file.exists(),
@@ -911,31 +993,34 @@ class BrightnessGuard:
         signal.signal(signal.SIGINT, self.request_shutdown)
         signal.signal(signal.SIGHUP, self.request_shutdown)
 
+        state = self.load_state()
+        if state is not None and state.get("phase") not in POST_WAKE_PHASES:
+            self.restore(restart_monitor_control=self.state_is_stale(state))
+            state = self.load_state()
+
+        session_monitor_started = self.start_session_monitor()
         event_monitor_started = self.start_event_monitor()
-        observed = self.observe_session()
-        if observed is not None:
-            self.session_active = observed
         log_event(
             "guard_started",
-            activeSessions=int(self.session_active),
+            activeSessions=0,
             recoveredState=self.load_state() is not None,
+            sessionMonitor=session_monitor_started,
         )
 
-        state = self.load_state()
-        if self.session_active:
-            self.engage()
+        # ponytail: after a mid-session restart, restore and wait for the next
+        # live capture start; bounded history replay can be added if that miss matters.
+        if (
+            state is not None
+            and state.get("phase") in POST_WAKE_PHASES
+            and self.snapshot_file.exists()
+            and not self.state_is_stale(state)
+            and event_monitor_started
+        ):
+            log_event("post_wake_state_recovered", phase=state.get("phase"))
+            if state.get("phase") != "awaiting-display-wake":
+                self.post_wake_deadline = time.monotonic() + self.post_wake_retry
         elif state is not None:
-            if (
-                state.get("phase") in POST_WAKE_PHASES
-                and self.snapshot_file.exists()
-                and not self.state_is_stale(state)
-                and event_monitor_started
-            ):
-                log_event("post_wake_state_recovered", phase=state.get("phase"))
-                if state.get("phase") != "awaiting-display-wake":
-                    self.post_wake_deadline = time.monotonic() + self.post_wake_retry
-            else:
-                self.restore(restart_monitor_control=self.state_is_stale(state))
+            self.restore(restart_monitor_control=self.state_is_stale(state))
 
         last_restore_retry = 0.0
         while not self.shutdown_requested:
@@ -943,8 +1028,13 @@ class BrightnessGuard:
             self.poll_display_events()
             if not self.event_monitor_is_alive() and now - self.last_event_monitor_attempt >= 10:
                 self.start_event_monitor()
-            transition = self.update_session()
-            if transition:
+            transitions = self.poll_session_events()
+            if not self.session_monitor_is_alive() and now - self.last_session_monitor_attempt >= 10:
+                self.start_session_monitor()
+            assertion_transition = self.poll_session_assertion(now)
+            if assertion_transition is not None:
+                transitions.append(assertion_transition)
+            for transition in transitions:
                 _, is_active = transition
                 if is_active:
                     self.restore_deadline = None
@@ -989,6 +1079,7 @@ class BrightnessGuard:
 
         if self.load_state() is not None:
             self.restore()
+        self.stop_session_monitor()
         self.stop_event_monitor()
         log_event("guard_stopped")
         return 0
