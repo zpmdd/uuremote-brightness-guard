@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import json
 import os
@@ -11,30 +12,54 @@ from pathlib import Path
 import re
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 SCHEMA_VERSION = 1
 MONITOR_CONTROL_EXECUTABLE = "/Applications/MonitorControl.app/Contents/MacOS/MonitorControl"
 MONITOR_CONTROL_BUNDLE_ID = "app.monitorcontrol.MonitorControl"
 UU_SERVER_EXECUTABLE = "/Applications/UURemote.app/Contents/Helpers/UURemoteServer"
-STATE_RE = re.compile(
-    r"onPeerConnectionState\(.*?handle:\s*(\d+),\s*state:.*?State\.(peerConnected|disconnected)\)"
-)
-LOG_TIMESTAMP_RE = re.compile(
-    r"^\[(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?\s"
-)
 BOOT_TIME_RE = re.compile(r"sec\s*=\s*(\d+)")
+PROC_PIDLISTFDS = 1
+PROC_PIDFDSOCKETINFO = 3
+PROX_FDTYPE_SOCKET = 2
+# offsetof(socket_fdinfo, psi.soi_protocol) in the Apple Silicon macOS ABI.
+SOCKET_PROTOCOL_OFFSET = 180
+SOCKET_FDINFO_BUFFER_SIZE = 1024
 POST_WAKE_PHASES = {
     "awaiting-display-wake",
     "post-wake-verification-pending",
     "post-wake-repair-pending",
 }
+
+
+class ProcFDInfo(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int32), ("type", ctypes.c_uint32)]
+
+
+LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
+LIBPROC.proc_pidinfo.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+LIBPROC.proc_pidinfo.restype = ctypes.c_int
+LIBPROC.proc_pidfdinfo.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
 
 
 def utc_now() -> str:
@@ -84,106 +109,6 @@ def system_boot_epoch() -> float:
     return time.time()
 
 
-def log_line_epoch(line: str, reference_epoch: Optional[float] = None) -> Optional[float]:
-    match = LOG_TIMESTAMP_RE.match(line)
-    if not match:
-        return None
-    reference = datetime.fromtimestamp(reference_epoch or time.time()).astimezone()
-    month, day, hour, minute, second, fraction = match.groups()
-    microsecond = int((fraction or "0").ljust(6, "0"))
-    try:
-        candidate = datetime(
-            reference.year,
-            int(month),
-            int(day),
-            int(hour),
-            int(minute),
-            int(second),
-            microsecond,
-            tzinfo=reference.tzinfo,
-        )
-    except ValueError:
-        return None
-    if candidate > reference + timedelta(days=1):
-        candidate = candidate.replace(year=reference.year - 1)
-    return candidate.timestamp()
-
-
-class SessionTracker:
-    def __init__(self) -> None:
-        self.active_handles: Set[str] = set()
-
-    @property
-    def active(self) -> bool:
-        return bool(self.active_handles)
-
-    def feed(self, line: str) -> Optional[Tuple[bool, bool]]:
-        match = STATE_RE.search(line)
-        if not match:
-            return None
-        was_active = self.active
-        handle, state = match.groups()
-        if state == "peerConnected":
-            self.active_handles.add(handle)
-        else:
-            self.active_handles.discard(handle)
-        is_active = self.active
-        if was_active == is_active:
-            return None
-        return was_active, is_active
-
-
-class LogFollower:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file = None
-        self._inode: Optional[int] = None
-        self._initial_offset: Optional[int] = None
-
-    def remember_current_end(self) -> None:
-        try:
-            stat = self.path.stat()
-        except OSError:
-            self._inode = None
-            self._initial_offset = None
-            return
-        self._inode = stat.st_ino
-        self._initial_offset = stat.st_size
-
-    def _open_if_needed(self) -> bool:
-        try:
-            stat = self.path.stat()
-        except OSError:
-            self.close()
-            return False
-
-        if self._file is not None and self._inode == stat.st_ino:
-            if stat.st_size < self._file.tell():
-                self._file.seek(0)
-            return True
-
-        self.close()
-        self._file = self.path.open("r", encoding="utf-8", errors="replace")
-        if self._inode == stat.st_ino and self._initial_offset is not None:
-            self._file.seek(min(self._initial_offset, stat.st_size))
-        else:
-            self._file.seek(0)
-        self._inode = stat.st_ino
-        self._initial_offset = None
-        return True
-
-    def poll(self) -> List[str]:
-        if not self._open_if_needed():
-            return []
-        assert self._file is not None
-        return self._file.readlines()
-
-    def close(self) -> None:
-        if self._file is not None:
-            self._file.close()
-        self._file = None
-
-
 class BrightnessGuard:
     def __init__(self) -> None:
         default_state_dir = Path.home() / "Library/Application Support/UURemoteBrightnessGuard"
@@ -195,14 +120,6 @@ class BrightnessGuard:
 
         default_helper = self.state_dir / "DisplayBrightnessTool"
         self.helper = Path(os.environ.get("UURBG_HELPER_PATH", str(default_helper)))
-        default_log_dir = (
-            Path("/Users/Shared/UURemote")
-            / str(os.getuid())
-            / "com.netease.uuremote.server/Logs/Server"
-        )
-        self.log_dir = Path(os.environ.get("UURBG_LOG_DIR", str(default_log_dir)))
-        self.current_log = self.log_dir / "UURemoteServer.log"
-
         self.fallback = env_float("UURBG_FALLBACK", 0.85, 0.0, 1.0)
         self.ddc_fallback = env_float("UURBG_DDC_FALLBACK", 0.70, 0.0, 1.0)
         try:
@@ -218,8 +135,9 @@ class BrightnessGuard:
         self.post_wake_delay = env_float("UURBG_POST_WAKE_DELAY", 4.0, 1.0, 30.0)
         self.post_wake_retry = env_float("UURBG_POST_WAKE_RETRY", 3.0, 1.0, 60.0)
 
-        self.tracker = SessionTracker()
-        self.follower = LogFollower(self.current_log)
+        self.session_active = False
+        self.server_pids: List[int] = []
+        self.next_server_pid_refresh = 0.0
         self.restore_deadline: Optional[float] = None
         self.post_wake_deadline: Optional[float] = None
         self.display_sleep_pending = False
@@ -287,25 +205,72 @@ class BrightnessGuard:
                 continue
         return pids
 
-    @classmethod
-    def process_start_epoch(cls, executable: str) -> Optional[float]:
-        starts: List[float] = []
-        for pid in cls.exact_process_pids(executable):
-            try:
-                result = subprocess.run(
-                    ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    env={**os.environ, "LC_ALL": "C"},
-                )
-                value = datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y")
-                local_zone = datetime.now().astimezone().tzinfo
-                starts.append(value.replace(tzinfo=local_zone).timestamp())
-            except (OSError, ValueError, subprocess.TimeoutExpired):
+    @staticmethod
+    def process_udp_socket_count(pid: int) -> Optional[int]:
+        needed = LIBPROC.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, None, 0)
+        if needed <= 0:
+            return None
+        capacity = needed // ctypes.sizeof(ProcFDInfo) + 32
+        entries = (ProcFDInfo * capacity)()
+        used = LIBPROC.proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            ctypes.byref(entries),
+            ctypes.sizeof(entries),
+        )
+        if used <= 0:
+            return None
+
+        count = 0
+        socket_info = ctypes.create_string_buffer(SOCKET_FDINFO_BUFFER_SIZE)
+        for entry in entries[: used // ctypes.sizeof(ProcFDInfo)]:
+            if entry.type != PROX_FDTYPE_SOCKET:
                 continue
-        return max(starts) if starts else None
+            detail_size = LIBPROC.proc_pidfdinfo(
+                pid,
+                entry.fd,
+                PROC_PIDFDSOCKETINFO,
+                socket_info,
+                len(socket_info),
+            )
+            if detail_size < SOCKET_PROTOCOL_OFFSET + ctypes.sizeof(ctypes.c_int32):
+                continue
+            protocol = ctypes.c_int32.from_buffer(socket_info, SOCKET_PROTOCOL_OFFSET).value
+            if protocol == socket.IPPROTO_UDP:
+                count += 1
+        return count
+
+    def observe_session(self) -> Optional[bool]:
+        now = time.monotonic()
+        if not self.server_pids and now >= self.next_server_pid_refresh:
+            self.server_pids = self.exact_process_pids(UU_SERVER_EXECUTABLE)
+            self.next_server_pid_refresh = now + 5
+        if not self.server_pids:
+            return False
+
+        observed = False
+        for pid in self.server_pids:
+            count = self.process_udp_socket_count(pid)
+            if count is None:
+                continue
+            observed = True
+            if count > 0:
+                return True
+        if observed:
+            return False
+
+        self.server_pids = []
+        self.next_server_pid_refresh = 0
+        return None
+
+    def update_session(self) -> Optional[Tuple[bool, bool]]:
+        observed = self.observe_session()
+        if observed is None or observed == self.session_active:
+            return None
+        previous = self.session_active
+        self.session_active = observed
+        return previous, observed
 
     def state_is_stale(self, state: Dict[str, object]) -> bool:
         saved = state.get("bootEpoch")
@@ -540,7 +505,7 @@ class BrightnessGuard:
             state is None
             or state.get("phase") not in POST_WAKE_PHASES
             or not self.snapshot_file.exists()
-            or self.tracker.active
+            or self.session_active
         ):
             return
         state["phase"] = "post-wake-verification-pending"
@@ -658,7 +623,7 @@ class BrightnessGuard:
         ):
             self.post_wake_deadline = None
             return False
-        if self.tracker.active:
+        if self.session_active:
             self.post_wake_deadline = None
             log_event("post_wake_verification_deferred", reason="active-session")
             return False
@@ -915,38 +880,13 @@ class BrightnessGuard:
             log_event("brightness_restore_pending")
         return success
 
-    def reconstruct_sessions(self) -> None:
-        self.tracker.active_handles.clear()
-        server_started = self.process_start_epoch(UU_SERVER_EXECUTABLE)
-        not_before = max(self.boot_epoch, server_started or self.boot_epoch) - 1
-        reference_epoch = time.time()
-        try:
-            paths = sorted(
-                self.log_dir.glob("UURemoteServer*.log"),
-                key=lambda item: item.stat().st_mtime_ns,
-            )
-        except OSError:
-            paths = []
-        for path in paths:
-            try:
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
-                    for line in handle:
-                        line_epoch = log_line_epoch(line, reference_epoch)
-                        if (
-                            "onPeerConnectionState" in line
-                            and line_epoch is not None
-                            and line_epoch >= not_before
-                        ):
-                            self.tracker.feed(line)
-            except OSError:
-                continue
-        self.follower.remember_current_end()
-
     def status(self) -> Dict[str, object]:
-        self.reconstruct_sessions()
+        observed = self.observe_session()
+        if observed is not None:
+            self.session_active = observed
         state = self.load_state()
         return {
-            "activeSessions": len(self.tracker.active_handles),
+            "activeSessions": int(self.session_active),
             "dimmed": bool(state and state.get("phase") in {"engaging", "dimmed", "restore-pending"}),
             "phase": state.get("phase") if state else "idle",
             "snapshotExists": self.snapshot_file.exists(),
@@ -972,15 +912,17 @@ class BrightnessGuard:
         signal.signal(signal.SIGHUP, self.request_shutdown)
 
         event_monitor_started = self.start_event_monitor()
-        self.reconstruct_sessions()
+        observed = self.observe_session()
+        if observed is not None:
+            self.session_active = observed
         log_event(
             "guard_started",
-            activeSessions=len(self.tracker.active_handles),
+            activeSessions=int(self.session_active),
             recoveredState=self.load_state() is not None,
         )
 
         state = self.load_state()
-        if self.tracker.active:
+        if self.session_active:
             self.engage()
         elif state is not None:
             if (
@@ -995,23 +937,20 @@ class BrightnessGuard:
             else:
                 self.restore(restart_monitor_control=self.state_is_stale(state))
 
-        last_server_check = 0.0
         last_restore_retry = 0.0
         while not self.shutdown_requested:
             now = time.monotonic()
             self.poll_display_events()
             if not self.event_monitor_is_alive() and now - self.last_event_monitor_attempt >= 10:
                 self.start_event_monitor()
-            for line in self.follower.poll():
-                transition = self.tracker.feed(line)
-                if not transition:
-                    continue
+            transition = self.update_session()
+            if transition:
                 _, is_active = transition
                 if is_active:
                     self.restore_deadline = None
                     self.post_wake_deadline = None
                     self.display_sleep_pending = False
-                    log_event("session_connected", activeSessions=len(self.tracker.active_handles))
+                    log_event("session_connected", activeSessions=1)
                     self.engage()
                 else:
                     self.restore_deadline = now + self.disconnect_grace
@@ -1023,29 +962,21 @@ class BrightnessGuard:
 
             if self.restore_deadline is not None and now >= self.restore_deadline:
                 self.restore_deadline = None
-                if not self.tracker.active:
+                if not self.session_active:
                     sleep_after_success = self.display_sleep_pending
                     self.display_sleep_pending = False
                     self.restore(sleep_after_success=sleep_after_success)
 
             if self.post_wake_deadline is not None and now >= self.post_wake_deadline:
                 self.post_wake_deadline = None
-                if not self.tracker.active:
+                if not self.session_active:
                     self.verify_post_wake_restore()
-
-            if now - last_server_check >= 5:
-                last_server_check = now
-                if self.tracker.active and not self.exact_process_pids(UU_SERVER_EXECUTABLE):
-                    self.tracker.active_handles.clear()
-                    self.restore_deadline = now
-                    self.display_sleep_pending = self.sleep_after_disconnect
-                    log_event("uuremote_server_stopped")
 
             state = self.load_state()
             if (
                 state
                 and state.get("phase") == "restore-pending"
-                and not self.tracker.active
+                and not self.session_active
                 and now - last_restore_retry >= 10
             ):
                 last_restore_retry = now
@@ -1056,7 +987,6 @@ class BrightnessGuard:
 
             time.sleep(self.poll_interval)
 
-        self.follower.close()
         if self.load_state() is not None:
             self.restore()
         self.stop_event_monitor()

@@ -12,7 +12,7 @@ A small macOS LaunchAgent that automatically dims every display when this Mac be
 
 ## Features
 
-- Detects real UU Remote connect/disconnect events from the local server log.
+- Detects remote connect/disconnect events from the local UU server process's live session channels, without depending on log formats.
 - Saves brightness separately for the built-in display and every external display.
 - Dims external monitors to hardware 0% through DDC/CI, then holds their gamma at 0 for a near-black physical output.
 - Restores the captured values after the final session disconnects, with a two-second debounce for connection glitches.
@@ -40,7 +40,7 @@ flowchart LR
 - External monitors with DDC/CI enabled. Some docks, adapters, or monitor inputs may block DDC/CI.
 - Xcode Command Line Tools, used once to compile the local Swift helper. Install them with `xcode-select --install`.
 
-The initial release was validated on Apple Silicon with macOS 26.5.2, UU Remote 4.34.0, MonitorControl 4.3.3, one built-in display, and two Dell U2720QM displays. Other versions and display topologies are currently unverified.
+The current version was validated on Apple Silicon with macOS 26.5.2, UU Remote 4.39.0, MonitorControl 4.3.3, one built-in display, and two Dell U2720QM displays. Other versions and display topologies are currently unverified.
 
 ## Quick start
 
@@ -96,7 +96,7 @@ Do not disconnect, power-cycle, or rearrange monitors while testing an active di
 
 ## How it works
 
-The Python guard follows UU Remote's local `UURemoteServer.log` and tracks `peerConnected` / `disconnected` transitions by session handle. It ignores events from a previous boot or server process. MonitorControl is not called to change brightness; when present, its process is paused briefly only to avoid conflicting writes.
+The Python guard uses the native macOS process interface to observe UDP session channels owned by `UURemoteServer`: a channel appearing means remote control started, and all channels closing means it ended. MonitorControl is not called to change brightness; when present, its process is paused briefly only to avoid conflicting writes.
 
 The Swift helper uses:
 
@@ -138,7 +138,7 @@ The display helper uses macOS private frameworks and is compiled locally rather 
 ## Limitations
 
 - Apple Silicon only in the current release.
-- UU Remote log formats are not a public API and may change.
+- UU Remote does not publish an API for inbound sessions; if its network-session implementation changes, this project may need an update.
 - DDC/CI behavior depends on the monitor, input, cable, dock, and macOS release.
 - External displays are matched by the runtime topology/slot order because the low-level service does not expose a stable public identifier.
 - MonitorControl is not required for a built-in-only setup. External-display use without it is possible but has less convenient compatibility testing and manual recovery.

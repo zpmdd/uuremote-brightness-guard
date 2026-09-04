@@ -12,7 +12,7 @@
 
 ## 功能
 
-- 从本机 UU 服务日志识别真实的远程连接和断开事件。
+- 从本机 UU 服务进程的实时会话通道识别远程连接和断开，不依赖日志格式。
 - 分别保存内置屏幕及每块外接屏的亮度。
 - 外接屏先通过 DDC/CI 降到硬件 0%，再持续把 gamma 保持为 0，得到接近全黑的物理输出。
 - 最后一个会话断开 2 秒后恢复各屏原值，避免短暂网络抖动造成反复闪屏。
@@ -40,7 +40,7 @@ flowchart LR
 - 外接显示器已启用 DDC/CI；部分扩展坞、转接器或显示器输入口可能不透传 DDC/CI。
 - Xcode Command Line Tools，仅在安装时用于本机编译 Swift 辅助工具；可运行 `xcode-select --install` 安装。
 
-首个版本已在 Apple Silicon、macOS 26.5.2、UU 远程 4.34.0、MonitorControl 4.3.3、一块内置屏和两块 Dell U2720QM 上验证。其他系统版本和显示器组合目前未验证。
+目前已在 Apple Silicon、macOS 26.5.2、UU 远程 4.39.0、MonitorControl 4.3.3、一块内置屏和两块 Dell U2720QM 上验证。其他系统版本和显示器组合目前未验证。
 
 ## 快速安装
 
@@ -96,7 +96,7 @@ LaunchAgent 名称为 `io.github.zpmdd.uuremote-brightness-guard`。日志位于
 
 ## 工作原理
 
-Python 守护程序持续读取本机 `UURemoteServer.log`，按会话句柄跟踪 `peerConnected` / `disconnected` 状态，并忽略上次开机或上一个 UU 服务进程留下的旧事件。亮度调整并不调用 MonitorControl；它存在时只会被短暂挂起，以避免同时写入产生冲突。
+Python 守护程序通过 macOS 原生进程接口观察 `UURemoteServer` 的 UDP 会话通道：通道出现即视为远控开始，全部关闭即视为远控结束。亮度调整并不调用 MonitorControl；它存在时只会被短暂挂起，以避免同时写入产生冲突。
 
 Swift 辅助工具使用：
 
@@ -138,7 +138,7 @@ make build
 ## 已知限制
 
 - 当前版本仅支持 Apple Silicon。
-- UU 远程日志格式不是公开 API，后续版本可能变化。
+- UU 远程没有公开被控会话 API；如果未来改变网络会话实现，本项目可能需要适配。
 - DDC/CI 是否可用取决于显示器、输入口、线缆、扩展坞和 macOS 版本。
 - 底层服务没有稳定的公开显示器标识，因此外接屏按当前拓扑/槽位顺序匹配。
 - 只有内置屏时不需要 MonitorControl；有外接屏时也能独立运行，但兼容性验证和手动恢复会不够方便。
