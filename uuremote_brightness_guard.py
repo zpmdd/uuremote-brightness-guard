@@ -26,7 +26,7 @@ UU_SERVER_EXECUTABLE = "/Applications/UURemote.app/Contents/Helpers/UURemoteServ
 BOOT_TIME_RE = re.compile(r"sec\s*=\s*(\d+)")
 UU_SESSION_ASSERTION_RE = re.compile(
     r'^\s*pid\s+(\d+)\(UURemoteServer\):.*\bPreventUserIdleDisplaySleep '
-    r'named: "idleDisplaySleepDisabled"\s*$',
+    r'named: "(?:idleDisplaySleepDisabled|UURemote Disable Display Sleep)"\s*$',
     re.MULTILINE,
 )
 SCSTREAM_EVENT_RE = re.compile(
@@ -44,6 +44,7 @@ PMSET_ASSERTION_HEADERS = ("Assertion status system-wide:", "Listed by owning pr
 POST_WAKE_PHASES = {
     "awaiting-display-wake",
     "post-wake-verification-pending",
+    # v1.0.3 compatibility: it now receives one bounded repair, never a retry loop.
     "post-wake-repair-pending",
 }
 
@@ -102,6 +103,7 @@ class BrightnessGuard:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_dir / "guard-state.json"
         self.snapshot_file = self.state_dir / "brightness-snapshot.json"
+        self.last_good_file = self.state_dir / "ddc-last-good.json"
         self.lock_file = self.state_dir / "guard.lock"
 
         default_helper = self.state_dir / "DisplayBrightnessTool"
@@ -117,9 +119,8 @@ class BrightnessGuard:
         self.disconnect_grace = env_float("UURBG_DISCONNECT_GRACE", 2.0, 0.0, 30.0)
         self.poll_interval = env_float("UURBG_POLL_INTERVAL", 0.25, 0.1, 5.0)
         self.sleep_after_disconnect = env_bool("UURBG_SLEEP_AFTER_DISCONNECT", True)
-        self.display_sleep_delay = env_float("UURBG_DISPLAY_SLEEP_DELAY", 1.0, 0.0, 10.0)
+        self.display_sleep_delay = env_float("UURBG_DISPLAY_SLEEP_DELAY", 5.0, 0.0, 10.0)
         self.post_wake_delay = env_float("UURBG_POST_WAKE_DELAY", 4.0, 1.0, 30.0)
-        self.post_wake_retry = env_float("UURBG_POST_WAKE_RETRY", 3.0, 1.0, 60.0)
 
         self.session_active = False
         self.active_streams: Set[Tuple[int, str]] = set()
@@ -128,6 +129,7 @@ class BrightnessGuard:
         self.next_session_assertion_check = 0.0
         self.session_assertion_missing_since: Optional[float] = None
         self.restore_deadline: Optional[float] = None
+        self.display_sleep_deadline: Optional[float] = None
         self.post_wake_deadline: Optional[float] = None
         self.display_sleep_pending = False
         self.shutdown_requested = False
@@ -135,6 +137,8 @@ class BrightnessGuard:
         self.holder_process: Optional[subprocess.Popen] = None
         self.event_monitor_process: Optional[subprocess.Popen] = None
         self.last_event_monitor_attempt = 0.0
+        self.display_event_serial = 0
+        self.last_display_wake: Optional[float] = None
         self.boot_epoch = system_boot_epoch()
 
     def acquire_lock(self) -> None:
@@ -309,10 +313,10 @@ class BrightnessGuard:
         return self.set_session_active(False)
 
     def poll_session_events(self) -> List[Tuple[bool, bool]]:
-        transitions: List[Tuple[bool, bool]] = []
+        was_active = self.session_active
         process = self.session_monitor_process
         if process is None:
-            return transitions
+            return []
         assert process.stdout is not None
         while True:
             ready, _, _ = select.select([process.stdout], [], [], 0)
@@ -325,16 +329,20 @@ class BrightnessGuard:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            transition = self.handle_session_log_payload(payload)
-            if transition is not None:
-                transitions.append(transition)
-        if process.poll() is not None:
+            self.handle_session_log_payload(payload)
+        monitor_stopped = process.poll() is not None
+        if monitor_stopped:
             log_event("session_monitor_stopped", exitCode=process.returncode)
             self.session_monitor_process = None
-            transition = self.force_session_inactive()
-            if transition is not None:
-                transitions.append(transition)
-        return transitions
+            self.force_session_inactive()
+        elif was_active and not self.session_active:
+            assertion_pids = self.observe_session_assertion_pids()
+            if assertion_pids:
+                self.session_active = True
+                self.session_assertion_missing_since = None
+        if self.session_active == was_active:
+            return []
+        return [(was_active, self.session_active)]
 
     def poll_session_assertion(self, now: float) -> Optional[Tuple[bool, bool]]:
         if not self.session_active:
@@ -526,8 +534,7 @@ class BrightnessGuard:
                 [str(self.helper), "events", "--parent-pid", str(os.getpid())],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
+                bufsize=0,
             )
         except OSError as exc:
             log_event("display_event_monitor_failed", reason=type(exc).__name__)
@@ -578,13 +585,19 @@ class BrightnessGuard:
         self.event_monitor_process = None
 
     def handle_display_event(self, event: str) -> None:
+        if event not in {"sleep", "wake"}:
+            return
+        self.display_event_serial += 1
+        self.last_display_wake = time.monotonic() if event == "wake" else None
+        state = self.load_state()
         if event == "sleep":
+            self.post_wake_deadline = None
+            if state is not None and state.get("phase") in POST_WAKE_PHASES:
+                state["phase"] = "awaiting-display-wake"
+                self.save_state(state)
             log_event("display_sleep_detected")
             return
-        if event != "wake":
-            return
         log_event("display_wake_detected")
-        state = self.load_state()
         if (
             state is None
             or state.get("phase") not in POST_WAKE_PHASES
@@ -626,8 +639,13 @@ class BrightnessGuard:
         if not self.start_event_monitor():
             log_event("display_sleep_failed", reason="event-monitor-unavailable")
             return False
-        if self.display_sleep_delay > 0:
-            time.sleep(self.display_sleep_delay)
+        assertion_pids = self.observe_session_assertion_pids()
+        if assertion_pids is None:
+            log_event("display_sleep_skipped", reason="session-state-unavailable")
+            return False
+        if assertion_pids:
+            log_event("display_sleep_skipped", reason="uu-session-active")
+            return False
         try:
             result = subprocess.run(
                 ["/usr/bin/pmset", "displaysleepnow"],
@@ -680,8 +698,28 @@ class BrightnessGuard:
             success=payload.get("success") if isinstance(payload, dict) else None,
             warnings=len(warnings) if isinstance(warnings, list) else 0,
             fallbacks=fallback_count,
+            **self.helper_diagnostics(payload),
         )
         return result.returncode == 0, payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def helper_diagnostics(payload: object) -> Dict[str, object]:
+        if not isinstance(payload, dict):
+            return {}
+        fields = ("target", "requested", "observed", "readable", "applied", "fallbackUsed", "detail")
+        warnings = payload.get("warnings", [])
+        result: Dict[str, object] = {
+            "warningDetails": [item for item in warnings if isinstance(item, str)]
+            if isinstance(warnings, list) else []
+        }
+        for group in ("native", "ddc", "gamma"):
+            values = payload.get(group, [])
+            if isinstance(values, list):
+                result[group] = [
+                    {field: item[field] for field in fields if field in item}
+                    for item in values if isinstance(item, dict)
+                ]
+        return result
 
     def snapshot_helper_arguments(self, action: str) -> List[str]:
         return [
@@ -698,7 +736,12 @@ class BrightnessGuard:
     def helper_succeeded(ok: bool, payload: Dict[str, object]) -> bool:
         return ok and payload.get("success") is True
 
+    def post_wake_event_changed(self, event_serial: int) -> bool:
+        self.poll_display_events()
+        return self.display_event_serial != event_serial
+
     def verify_post_wake_restore(self) -> bool:
+        self.poll_display_events()
         state = self.load_state()
         if (
             state is None
@@ -707,49 +750,84 @@ class BrightnessGuard:
         ):
             self.post_wake_deadline = None
             return False
+        if state.get("phase") == "awaiting-display-wake":
+            self.post_wake_deadline = None
+            return False
+        if self.post_wake_deadline is not None and time.monotonic() < self.post_wake_deadline:
+            return False
         if self.session_active:
             self.post_wake_deadline = None
             log_event("post_wake_verification_deferred", reason="active-session")
             return False
 
-        verify_arguments = self.snapshot_helper_arguments("verify")
-        verify_ok, verify_payload = self.helper_call(verify_arguments)
-        if self.helper_succeeded(verify_ok, verify_payload):
-            self.clear_state()
-            self.post_wake_deadline = None
-            log_event("post_wake_brightness_verified", repaired=False)
-            return True
+        event_serial = self.display_event_serial
+        monitor_pids = self.exact_process_pids(MONITOR_CONTROL_EXECUTABLE)
+        state["pausedMonitorControlPids"] = monitor_pids
+        self.save_state(state)
+        clear_after_resume = False
+        try:
+            self.stop_pids(monitor_pids)
+            if self.post_wake_event_changed(event_serial):
+                return False
+            verify_arguments = self.snapshot_helper_arguments("verify")
+            verify_ok, verify_payload = self.helper_call(verify_arguments)
+            if self.post_wake_event_changed(event_serial):
+                return False
+            if self.helper_succeeded(verify_ok, verify_payload):
+                clear_after_resume = True
+                self.post_wake_deadline = None
+                log_event("post_wake_brightness_verified", repaired=False)
+                return True
 
-        restore_arguments = self.snapshot_helper_arguments("restore")
-        restore_ok, restore_payload = self.helper_call(restore_arguments)
-        time.sleep(0.4)
-        reverify_ok, reverify_payload = self.helper_call(verify_arguments)
-        if self.helper_succeeded(reverify_ok, reverify_payload):
-            self.clear_state()
+            if state.get("postWakeRepairAttempted"):
+                clear_after_resume = True
+                self.post_wake_deadline = None
+                log_event(
+                    "post_wake_brightness_unverified",
+                    reason="repair-already-attempted",
+                    **self.helper_diagnostics(verify_payload),
+                )
+                return False
+            state["postWakeRepairAttempted"] = True
+            self.save_state(state)
+            restore_arguments = self.snapshot_helper_arguments("restore")
+            restore_ok, restore_payload = self.helper_call(restore_arguments)
+            if self.post_wake_event_changed(event_serial):
+                return False
+            time.sleep(0.4)
+            if self.post_wake_event_changed(event_serial):
+                return False
+            reverify_ok, reverify_payload = self.helper_call(verify_arguments)
+            if self.post_wake_event_changed(event_serial):
+                return False
+            if self.helper_succeeded(reverify_ok, reverify_payload):
+                clear_after_resume = True
+                self.post_wake_deadline = None
+                log_event(
+                    "post_wake_brightness_verified",
+                    repaired=True,
+                    restoreSuccess=self.helper_succeeded(restore_ok, restore_payload),
+                )
+                return True
+
+            warnings = reverify_payload.get("warnings", [])
+            clear_after_resume = True
             self.post_wake_deadline = None
             log_event(
-                "post_wake_brightness_verified",
-                repaired=True,
+                "post_wake_brightness_unverified",
                 restoreSuccess=self.helper_succeeded(restore_ok, restore_payload),
+                warnings=warnings if isinstance(warnings, list) else [],
             )
-            return True
-
-        attempts = int(state.get("postWakeAttempts", 0)) + 1
-        state.update({
-            "phase": "post-wake-repair-pending",
-            "lastPostWakeAttemptAt": utc_now(),
-            "postWakeAttempts": attempts,
-            "pausedMonitorControlPids": [],
-            "sleepAfterRestore": False,
-        })
-        self.save_state(state)
-        self.post_wake_deadline = time.monotonic() + self.post_wake_retry
-        log_event(
-            "post_wake_brightness_pending",
-            attempts=attempts,
-            retryAfterSeconds=self.post_wake_retry,
-        )
-        return False
+            return False
+        finally:
+            self.resume_pids(monitor_pids)
+            if clear_after_resume:
+                self.clear_state()
+            else:
+                state = self.load_state()
+                if state is not None:
+                    state["pausedMonitorControlPids"] = []
+                    self.save_state(state)
 
     def holder_is_alive(self, pid: object) -> bool:
         try:
@@ -768,11 +846,14 @@ class BrightnessGuard:
         return str(self.helper) in command and " hold " in f" {command} "
 
     def start_holder(self, reuse_snapshot: bool) -> Tuple[bool, Dict[str, object], Optional[int]]:
+        self.poll_display_events()
         arguments = [
             str(self.helper),
             "hold",
             "--snapshot",
             str(self.snapshot_file),
+            "--last-good",
+            str(self.last_good_file),
             "--dim-factor",
             str(self.dim_factor),
             "--fallback",
@@ -784,6 +865,12 @@ class BrightnessGuard:
         ]
         if reuse_snapshot:
             arguments.append("--reuse-snapshot")
+        elif (
+            not self.event_monitor_is_alive()
+            or self.last_display_wake is None
+            or time.monotonic() - self.last_display_wake < self.post_wake_delay
+        ):
+            arguments.append("--protect-wake-snapshot")
         try:
             process = subprocess.Popen(
                 arguments,
@@ -823,6 +910,7 @@ class BrightnessGuard:
             "holder_ready",
             success=payload.get("success"),
             warnings=len(warnings) if isinstance(warnings, list) else 0,
+            **self.helper_diagnostics(payload),
         )
         return True, payload, process.pid
 
@@ -849,6 +937,7 @@ class BrightnessGuard:
     def engage(self) -> bool:
         existing = self.load_state()
         if existing and self.snapshot_file.exists():
+            existing.pop("postWakeRepairAttempted", None)
             paused = [int(value) for value in existing.get("pausedMonitorControlPids", [])]
             paused += self.stop_pids(self.exact_process_pids(MONITOR_CONTROL_EXECUTABLE))
             existing["pausedMonitorControlPids"] = sorted(set(paused))
@@ -938,16 +1027,16 @@ class BrightnessGuard:
             log_event("brightness_restored", usedFallback=force_fallback)
             if sleep_after_success:
                 state.update({
-                    "phase": "awaiting-display-wake",
+                    "phase": "display-sleep-pending",
                     "restoredAt": utc_now(),
                     "bootEpoch": self.boot_epoch,
                     "pausedMonitorControlPids": [],
                     "sleepAfterRestore": False,
-                    "postWakeAttempts": 0,
                 })
                 self.save_state(state)
-                if self.request_display_sleep():
-                    log_event("post_wake_verification_armed")
+                if self.start_event_monitor():
+                    self.display_sleep_deadline = time.monotonic() + self.display_sleep_delay
+                    log_event("display_sleep_scheduled", delaySeconds=self.display_sleep_delay)
                 else:
                     self.clear_state()
                     log_event("post_wake_verification_skipped", reason="display-sleep-failed")
@@ -980,7 +1069,6 @@ class BrightnessGuard:
             "sleepAfterDisconnect": self.sleep_after_disconnect,
             "displaySleepDelaySeconds": self.display_sleep_delay,
             "postWakeDelaySeconds": self.post_wake_delay,
-            "postWakeRetrySeconds": self.post_wake_retry,
             "eventMonitorRunning": self.event_monitor_detected(),
         }
 
@@ -997,6 +1085,11 @@ class BrightnessGuard:
         if state is not None and state.get("phase") not in POST_WAKE_PHASES:
             self.restore(restart_monitor_control=self.state_is_stale(state))
             state = self.load_state()
+        elif state is not None and state.get("pausedMonitorControlPids"):
+            monitor_pids = self.exact_process_pids(MONITOR_CONTROL_EXECUTABLE)
+            self.resume_pids(pid for pid in state["pausedMonitorControlPids"] if pid in monitor_pids)
+            state["pausedMonitorControlPids"] = []
+            self.save_state(state)
 
         session_monitor_started = self.start_session_monitor()
         event_monitor_started = self.start_event_monitor()
@@ -1018,7 +1111,7 @@ class BrightnessGuard:
         ):
             log_event("post_wake_state_recovered", phase=state.get("phase"))
             if state.get("phase") != "awaiting-display-wake":
-                self.post_wake_deadline = time.monotonic() + self.post_wake_retry
+                self.post_wake_deadline = time.monotonic() + self.post_wake_delay
         elif state is not None:
             self.restore(restart_monitor_control=self.state_is_stale(state))
 
@@ -1038,6 +1131,7 @@ class BrightnessGuard:
                 _, is_active = transition
                 if is_active:
                     self.restore_deadline = None
+                    self.display_sleep_deadline = None
                     self.post_wake_deadline = None
                     self.display_sleep_pending = False
                     log_event("session_connected", activeSessions=1)
@@ -1056,6 +1150,22 @@ class BrightnessGuard:
                     sleep_after_success = self.display_sleep_pending
                     self.display_sleep_pending = False
                     self.restore(sleep_after_success=sleep_after_success)
+
+            if self.display_sleep_deadline is not None and now >= self.display_sleep_deadline:
+                self.display_sleep_deadline = None
+                state = self.load_state()
+                if (
+                    not self.session_active
+                    and state is not None
+                    and state.get("phase") == "display-sleep-pending"
+                ):
+                    if self.request_display_sleep():
+                        state["phase"] = "awaiting-display-wake"
+                        self.save_state(state)
+                        log_event("post_wake_verification_armed")
+                    else:
+                        self.clear_state()
+                        log_event("post_wake_verification_skipped", reason="display-sleep-failed")
 
             if self.post_wake_deadline is not None and now >= self.post_wake_deadline:
                 self.post_wake_deadline = None

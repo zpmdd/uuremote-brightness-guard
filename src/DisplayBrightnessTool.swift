@@ -28,6 +28,13 @@ private struct DDCSnapshot: Codable {
   let slot: Int
   let current: UInt16?
   let maximum: UInt16?
+  var registryID: UInt64?
+  var captureDetail: String?
+}
+
+private struct DDCBaseline: Codable {
+  let bootSession: String
+  let displays: [DDCSnapshot]
 }
 
 private struct BrightnessSnapshot: Codable {
@@ -59,6 +66,7 @@ private struct CommandResult: Codable {
 
 private struct RuntimeDDCService {
   let slot: Int
+  let registryID: UInt64?
   let service: IOAVService?
 }
 
@@ -98,6 +106,26 @@ private func checksum(seed: UInt8, data: [UInt8], end: Int) -> UInt8 {
   return value
 }
 
+private func parseDDCReply(
+  _ reply: [UInt8],
+  expectedVCP: UInt8
+) -> (current: UInt16, maximum: UInt16)? {
+  // Get VCP reply: source, length, reply opcode, status, VCP, type, max, current, checksum.
+  guard reply.count == 11,
+        reply[0] == ddcAddress << 1,
+        reply[1] & 0x7f == 8,
+        reply[2] == 0x02,
+        reply[3] == 0,
+        reply[4] == expectedVCP,
+        reply[5] == 0,
+        checksum(seed: 0x50, data: reply, end: 9) == reply[10]
+  else { return nil }
+  let maximum = UInt16(reply[6]) << 8 | UInt16(reply[7])
+  let current = UInt16(reply[8]) << 8 | UInt16(reply[9])
+  guard maximum > 0, current <= maximum else { return nil }
+  return (current, maximum)
+}
+
 private func performDDC(
   service: IOAVService?,
   send: [UInt8],
@@ -122,16 +150,16 @@ private func performDDC(
       ) == KERN_SUCCESS
     }
 
-    guard replyLength > 0 else {
-      if writeSucceeded { return [] }
+    guard writeSucceeded else {
       usleep(20_000)
       continue
     }
+    guard replyLength > 0 else { return [] }
 
     var reply = [UInt8](repeating: 0, count: replyLength)
     usleep(50_000)
     if IOAVServiceReadI2C(service, UInt32(ddcAddress), 0, &reply, UInt32(reply.count)) == KERN_SUCCESS,
-       checksum(seed: 0x50, data: reply, end: reply.count - 2) == reply.last
+       parseDDCReply(reply, expectedVCP: send[0]) != nil
     {
       return reply
     }
@@ -141,13 +169,8 @@ private func performDDC(
 }
 
 private func readDDCBrightness(_ service: IOAVService?) -> (current: UInt16, maximum: UInt16)? {
-  guard let reply = performDDC(service: service, send: [brightnessVCP], replyLength: 11),
-        reply.count >= 10
-  else { return nil }
-  let maximum = UInt16(reply[6]) << 8 | UInt16(reply[7])
-  let current = UInt16(reply[8]) << 8 | UInt16(reply[9])
-  guard maximum > 0, current <= maximum else { return nil }
-  return (current, maximum)
+  guard let reply = performDDC(service: service, send: [brightnessVCP], replyLength: 11) else { return nil }
+  return parseDDCReply(reply, expectedVCP: brightnessVCP)
 }
 
 private func writeDDCBrightness(_ service: IOAVService?, value: UInt16) -> Bool {
@@ -211,7 +234,11 @@ private func discoverDDCServices() -> [RuntimeDDCService] {
     else { continue }
 
     let service = IOAVServiceCreateWithService(kCFAllocatorDefault, object.entry)?.takeRetainedValue()
-    candidates.append(RuntimeDDCService(slot: slot, service: service))
+    var registryID: UInt64 = 0
+    let identified = IORegistryEntryGetRegistryEntryID(object.entry, &registryID) == KERN_SUCCESS
+    candidates.append(RuntimeDDCService(
+      slot: slot, registryID: identified ? registryID : nil, service: service
+    ))
     slot += 1
   }
   return candidates
@@ -298,7 +325,36 @@ private func applyGamma(_ snapshot: GammaSnapshot, factor: Float) -> Bool {
   ) == .success
 }
 
-private func captureSnapshot() throws -> BrightnessSnapshot {
+private func selectDDCRestoreValue(
+  _ captured: DDCSnapshot,
+  previous: [DDCSnapshot],
+  protectZero: Bool
+) -> DDCSnapshot {
+  let valid = captured.current != nil && (captured.maximum ?? 0) > 0
+    && captured.current! <= captured.maximum!
+  if valid && (!protectZero || captured.current != 0) {
+    return captured
+  }
+  // Registry IDs are only comparable within one boot; never reuse a cache by slot.
+  let saved = previous.first {
+    captured.registryID != nil && $0.registryID == captured.registryID
+      && $0.current != nil && ($0.maximum ?? 0) > 0 && $0.current! <= $0.maximum!
+      && (captured.maximum == nil || $0.maximum == captured.maximum)
+  }
+  let source = saved == nil ? "fallback" : "last-good"
+  return DDCSnapshot(
+    slot: captured.slot,
+    current: saved?.current,
+    maximum: saved?.maximum ?? ((captured.maximum ?? 0) > 0 ? captured.maximum : nil),
+    registryID: captured.registryID,
+    captureDetail: "snapshot source=\(source), captured=\(captured.current.map(String.init) ?? "unreadable"), restore=\((saved?.current).map(String.init) ?? "fallback")"
+  )
+}
+
+private func captureSnapshot(
+  protectZero: Bool = false,
+  previousDDC: [DDCSnapshot] = []
+) throws -> BrightnessSnapshot {
   let displays = try onlineDisplayIDs()
   var native: [NativeSnapshot] = []
   var gamma: [GammaSnapshot] = []
@@ -317,8 +373,20 @@ private func captureSnapshot() throws -> BrightnessSnapshot {
   }
 
   let ddc = discoverDDCServices().map { runtime -> DDCSnapshot in
-    let value = readDDCBrightness(runtime.service)
-    return DDCSnapshot(slot: runtime.slot, current: value?.current, maximum: value?.maximum)
+    var value = readDDCBrightness(runtime.service)
+    var retried = false
+    if protectZero && (value == nil || value?.current == 0) {
+      // One short re-read, not a wait-for-wake loop that delays privacy dimming.
+      usleep(120_000)
+      let retry = readDDCBrightness(runtime.service)
+      if let retry, retry.current > 0 { value = retry }
+      retried = true
+    }
+    return selectDDCRestoreValue(DDCSnapshot(
+      slot: runtime.slot, current: value?.current, maximum: value?.maximum,
+      registryID: runtime.registryID,
+      captureDetail: "snapshot source=\(retried ? "capture-retry" : "capture"), restore=\((value?.current).map(String.init) ?? "unreadable")"
+    ), previous: previousDDC, protectZero: protectZero)
   }
 
   let formatter = ISO8601DateFormatter()
@@ -331,7 +399,7 @@ private func captureSnapshot() throws -> BrightnessSnapshot {
   )
 }
 
-private func saveSnapshot(_ snapshot: BrightnessSnapshot, path: String) throws {
+private func saveSnapshot<T: Encodable>(_ snapshot: T, path: String) throws {
   let encoder = JSONEncoder()
   encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
   let data = try encoder.encode(snapshot)
@@ -350,6 +418,39 @@ private func saveSnapshot(_ snapshot: BrightnessSnapshot, path: String) throws {
 private func loadSnapshot(path: String) throws -> BrightnessSnapshot {
   let data = try Data(contentsOf: URL(fileURLWithPath: path))
   return try JSONDecoder().decode(BrightnessSnapshot.self, from: data)
+}
+
+private func bootSession() -> String? {
+  var boot = timeval()
+  var size = MemoryLayout<timeval>.size
+  guard sysctlbyname("kern.boottime", &boot, &size, nil, 0) == 0 else { return nil }
+  return "\(boot.tv_sec):\(boot.tv_usec)"
+}
+
+private func loadDDCBaseline(path: String?, boot: String?) -> [DDCSnapshot] {
+  guard let path, let boot,
+        let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+        let saved = try? JSONDecoder().decode(DDCBaseline.self, from: data),
+        saved.bootSession == boot
+  else { return [] }
+  return saved.displays
+}
+
+private func captureRestoreSnapshot(
+  path: String, baselinePath: String?, protectZero: Bool
+) throws -> BrightnessSnapshot {
+  let boot = bootSession()
+  let previous = loadDDCBaseline(path: baselinePath, boot: boot)
+  let snapshot = try captureSnapshot(
+    protectZero: protectZero || displaysAreAsleep() != false,
+    previousDDC: previous
+  )
+  try saveSnapshot(snapshot, path: path)
+  if let baselinePath, let boot {
+    let reliable = snapshot.ddc.filter { $0.current != nil && $0.registryID != nil }
+    try saveSnapshot(DDCBaseline(bootSession: boot, displays: reliable), path: baselinePath)
+  }
+  return snapshot
 }
 
 private func setNative(displayID: CGDirectDisplayID, value: Float) -> (Bool, Float?) {
@@ -393,7 +494,9 @@ private func dim(snapshot: BrightnessSnapshot, factor: Float) -> CommandResult {
       observed: observed.map { Double($0.current) / Double($0.maximum) },
       applied: applied,
       fallbackUsed: false,
-      detail: applied ? nil : "DDC write failed"
+      detail: applied
+        ? snapshot.ddc.first(where: { $0.slot == service.slot })?.captureDetail
+        : "DDC write failed"
     ))
     if !applied { warnings.append("ddc-\(service.slot) could not be dimmed") }
   }
@@ -494,11 +597,12 @@ private func restore(
     )
     let item = saved ?? linearGamma(displayID: displayID, slot: slot)
     let applied = applyGamma(item, factor: 1)
+    let observed = captureGamma(displayID: displayID, slot: slot)
     gammaResults.append(TargetResult(
       target: "gamma-\(slot)",
       readable: saved?.captured != false && saved != nil,
-      requested: 1,
-      observed: nil,
+      requested: Double(gammaPeak(item)),
+      observed: observed.map { Double(gammaPeak($0)) },
       applied: applied,
       fallbackUsed: saved == nil || saved?.captured == false,
       detail: applied ? nil : "gamma restore failed"
@@ -776,6 +880,9 @@ private func monitorScreenEvents(parentPID: pid_t) {
 
   emitScreenEvent("ready")
   var lastPolledState = displaysAreAsleep()
+  if let lastPolledState {
+    emitScreenEvent(lastPolledState ? "sleep" : "wake")
+  }
   while processExists(parentPID) {
     RunLoop.current.run(until: Date().addingTimeInterval(0.25))
     let currentState = displaysAreAsleep()
@@ -792,14 +899,17 @@ private func holdDimmed(
   fallback: Float,
   ddcFallback: Float,
   parentPID: pid_t,
-  reuseSnapshot: Bool
+  reuseSnapshot: Bool,
+  baselinePath: String?,
+  protectZero: Bool
 ) throws -> CommandResult {
   let snapshot: BrightnessSnapshot
   if reuseSnapshot {
     snapshot = try loadSnapshot(path: snapshotPath)
   } else {
-    snapshot = try captureSnapshot()
-    try saveSnapshot(snapshot, path: snapshotPath)
+    snapshot = try captureRestoreSnapshot(
+      path: snapshotPath, baselinePath: baselinePath, protectZero: protectZero
+    )
   }
 
   signal(SIGTERM, SIG_IGN)
@@ -857,8 +967,10 @@ private func run() throws {
       throw ToolError.usage("dim requires --snapshot PATH")
     }
     let factor = Float(argument("--dim-factor", in: arguments) ?? "0.0") ?? 0.0
-    let snapshot = try captureSnapshot()
-    try saveSnapshot(snapshot, path: path)
+    let snapshot = try captureRestoreSnapshot(
+      path: path, baselinePath: argument("--last-good", in: arguments),
+      protectZero: arguments.contains("--protect-wake-snapshot")
+    )
     try emit(dim(snapshot: snapshot, factor: factor))
   case "hold":
     guard let path = argument("--snapshot", in: arguments) else {
@@ -875,7 +987,9 @@ private func run() throws {
       fallback: fallback,
       ddcFallback: ddcFallback,
       parentPID: parentPID,
-      reuseSnapshot: reuseSnapshot
+      reuseSnapshot: reuseSnapshot,
+      baselinePath: argument("--last-good", in: arguments),
+      protectZero: arguments.contains("--protect-wake-snapshot")
     ))
   case "restore":
     guard let path = argument("--snapshot", in: arguments) else {
@@ -915,6 +1029,85 @@ private func run() throws {
   }
 }
 
+#if DDC_REPLY_SELF_TEST
+private func checkDDCReplyParsing() {
+  let valid: [UInt8] = [0x6e, 0x88, 0x02, 0, 0x10, 0, 0, 100, 0, 70, 0x86]
+  let parsed = parseDDCReply(valid, expectedVCP: brightnessVCP)
+  precondition(parsed?.current == 70 && parsed?.maximum == 100, "valid brightness reply")
+  for (index, value): (Int, UInt8) in [
+    (0, 0x50), // wrong source
+    (1, 0x87), // wrong payload length
+    (2, 0x01), // request instead of reply
+    (3, 0x01), // unsupported VCP
+    (4, 0x62), // valid volume reply must not become brightness
+    (5, 0x01), // momentary VCP instead of continuous brightness
+    (7, 0), // zero maximum
+    (9, 101), // current exceeds maximum
+  ] {
+    var invalid = valid
+    invalid[index] = value
+    invalid[10] = checksum(seed: 0x50, data: invalid, end: 9)
+    precondition(parseDDCReply(invalid, expectedVCP: brightnessVCP) == nil, "invalid field \(index)")
+  }
+  var badChecksum = valid
+  badChecksum[10] ^= 1
+  precondition(parseDDCReply(badChecksum, expectedVCP: brightnessVCP) == nil, "bad checksum")
+  precondition(parseDDCReply(Array(valid.dropLast()), expectedVCP: brightnessVCP) == nil, "truncated reply")
+  precondition(parseDDCReply(valid + [0], expectedVCP: brightnessVCP) == nil, "overlong reply")
+  print("DDC reply parsing checks passed (no hardware access)")
+}
+checkDDCReplyParsing()
+private func checkWakeSnapshotProtection() throws {
+  let previous = [
+    DDCSnapshot(slot: 0, current: 70, maximum: 100, registryID: 10),
+    DDCSnapshot(slot: 1, current: 60, maximum: 100, registryID: 20),
+  ]
+  let zero = DDCSnapshot(slot: 0, current: 0, maximum: 100, registryID: 10)
+  precondition(selectDDCRestoreValue(zero, previous: previous, protectZero: true).current == 70,
+               "wake zero must not replace the last good brightness")
+  precondition(selectDDCRestoreValue(zero, previous: previous, protectZero: false).current == 0,
+               "a deliberate zero outside the wake window must remain zero")
+  let missing = selectDDCRestoreValue(zero, previous: [], protectZero: true)
+  precondition(missing.current == nil && missing.maximum == 100,
+               "without a baseline, restore and verify must both use their existing fallback")
+  let moved = DDCSnapshot(slot: 0, current: 0, maximum: 100, registryID: 20)
+  precondition(selectDDCRestoreValue(moved, previous: previous, protectZero: true).current == 60,
+               "match by registry identity, not reordered slots")
+  for identity: UInt64? in [nil, 30] {
+    let unknown = DDCSnapshot(slot: 0, current: 0, maximum: 100, registryID: identity)
+    precondition(selectDDCRestoreValue(unknown, previous: previous, protectZero: true).current == nil,
+                 "unknown displays must not inherit another display's brightness")
+  }
+  let changedMaximum = DDCSnapshot(slot: 0, current: 0, maximum: 255, registryID: 10)
+  precondition(selectDDCRestoreValue(changedMaximum, previous: previous, protectZero: true).current == nil,
+               "a changed DDC scale invalidates the cached value")
+  let unreadable = DDCSnapshot(slot: 0, current: nil, maximum: nil, registryID: 10)
+  precondition(selectDDCRestoreValue(unreadable, previous: previous, protectZero: true).current == 70,
+               "an unreadable value may use the identified baseline")
+  let manual = DDCSnapshot(slot: 0, current: 80, maximum: 100, registryID: 10)
+  precondition(selectDDCRestoreValue(manual, previous: previous, protectZero: true).current == 80,
+               "a readable nonzero value takes precedence over history")
+  precondition(selectDDCRestoreValue(zero, previous: [zero], protectZero: true).current == 0,
+               "a previously trusted intentional zero remains valid")
+
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let path = directory.appendingPathComponent("ddc-last-good.json").path
+  try saveSnapshot(DDCBaseline(bootSession: "boot-A", displays: previous), path: path)
+  precondition(loadDDCBaseline(path: path, boot: "boot-A").count == 2, "same-boot baseline")
+  precondition(loadDDCBaseline(path: path, boot: "boot-B").isEmpty, "ignore a previous boot's registry IDs")
+  precondition(loadDDCBaseline(path: path, boot: nil).isEmpty, "unknown boot fails safe")
+  precondition(loadDDCBaseline(path: path + ".missing", boot: "boot-A").isEmpty, "missing cache fails safe")
+  let mode = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber
+  precondition(mode?.intValue == 0o600, "private baseline permissions")
+  // Existing on-disk recovery snapshots remain readable after the upgrade.
+  let legacy = Data("{\"slot\":0,\"current\":70,\"maximum\":100}".utf8)
+  let decoded = try JSONDecoder().decode(DDCSnapshot.self, from: legacy)
+  precondition(decoded.current == 70 && decoded.registryID == nil, "legacy snapshot compatibility")
+  print("Wake snapshot protection checks passed (no hardware access)")
+}
+try checkWakeSnapshotProtection()
+#else
 do {
   try run()
 } catch {
@@ -922,3 +1115,4 @@ do {
   FileHandle.standardError.write(Data(message.utf8))
   exit(2)
 }
+#endif

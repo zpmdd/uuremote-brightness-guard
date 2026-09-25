@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Recognize UU Remote 4.41.2's renamed active-session display-sleep assertion while retaining the older name, preventing false disconnects and display-sleep requests during an active capture.
+- Make the five-second post-restore display-sleep delay cancellable and recheck that UU is disconnected immediately before sleeping the displays.
+- Collapse queued ScreenCaptureKit events to their final session state and bridge capture-stream turnover while UU's active-session assertion remains present.
+- Stop automatic brightness writes after one unsuccessful post-wake repair, preserving manual control instead of retrying forever.
+- Cancel wake verification when displays return to sleep, retaining the snapshot for the next wake instead of attempting recovery on sleeping displays.
+- Validate DDC reply headers, status, and feature code before accepting brightness values; coordinate wake verification with MonitorControl and log per-target readback details.
+- Protect new snapshots from wake-time zero readings: briefly re-read, then use a same-boot, same-display reliable record or the existing fallback instead of restoring and verifying an erroneous zero target. Preserve intentional minimum brightness outside the wake window and record the selected source in diagnostics.
+
+### Validation — 2026-09-25
+
+- Passed 30 Python tests, hardware-free DDC reply/wake snapshot checks, and LaunchAgent rendering checks. The new assertion-name regressions failed on the old parser and passed after the compatibility fix.
+- Passed three local remote-control cycles on macOS 26.5.2 with UU Remote 4.41.2, a built-in display, and two Dell U2720QM displays: three connections, three restorations, and three display-sleep requests, without false disconnects or recurring flicker/permission dialogs. Post-wake brightness and gamma verification passed; this is single-setup acceptance, not a guarantee for other hardware or future UU versions.
+- Updated Chinese/English documentation with compatibility details, upgrade risks, and the distinction between this unreleased branch and existing Release ZIPs.
+
 ## [1.0.3] - 2026-09-04
 
 ### Fixed
@@ -38,6 +56,7 @@ All notable changes to this project will be documented in this file. The format 
 - Built-in-display-only installation without requiring MonitorControl.
 - English and Simplified Chinese documentation plus macOS CI.
 
+[Unreleased]: https://github.com/zpmdd/uuremote-brightness-guard/compare/v1.0.3...HEAD
 [1.0.3]: https://github.com/zpmdd/uuremote-brightness-guard/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/zpmdd/uuremote-brightness-guard/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/zpmdd/uuremote-brightness-guard/compare/v1.0.0...v1.0.1
